@@ -30,7 +30,7 @@ To build stash-box on linux [libvips](https://www.libvips.org/) must be installe
 
 1. Run `make` to build the application.
 2. Stash-box requires access to a PostgreSQL database server. Suppose stash-box doesn't find a configuration file (defaults to `stash-box-config.yml` in the current directory). In that case, it will generate a default configuration file with a default PostgreSQL connection string (`postgres@localhost/stash-box?sslmode=disable`). You can adjust the connection string as needed.
-3. The database must be created and available. If the PostgreSQL user is not a superuser, run `CREATE EXTENSION pg_trgm; CREATE EXTENSION pgcrypto;` by a superuser before rerunning Stash-box. If the schema is not present, it will be created within the database.
+3. The database must be created and available. If the PostgreSQL user is not a superuser, run `CREATE EXTENSION pg_search; CREATE EXTENSION bktree;` by a superuser before rerunning Stash-box. If the schema is not present, it will be created within the database.
 4. The `sslmode` parameter is documented [here](https://godoc.org/github.com/lib/pq). Use `sslmode=disable` to not use SSL for the database connection. The default is `require`.
 5. After ensuring the database connection and availability, rerun Stash-box.
 #### Schema migrations and initial Admin user
@@ -84,6 +84,7 @@ There are two ways to authenticate a user in Stash-box: a session or an API key.
 | `email_user` | (none) | Username for the SMTP server. Optional. |
 | `email_password` | (none) | Password for the SMTP server. Optional. |
 | `email_from` | (none) | Email address from which to send emails. |
+| `email_tls_mode` | `mandatory` | STARTTLS policy for the SMTP client. `mandatory` requires STARTTLS, `opportunistic` uses it when offered, `none` disables TLS. |
 | `host_url` | (none) | Base URL for the server. Used when sending emails. Should be in the form of `https://hostname.com`. |
 | `image_location` | (none) | Path to store images, for local image storage. An error will be displayed if this is not set when creating non-URL images. |
 | `image_backend` | (`file`) | Storage solution for images. Can be set to either `file` or `s3`. |
@@ -96,23 +97,46 @@ There are two ways to authenticate a user in Stash-box: a session or an API key.
 | `s3.endpoint` | (none) | Hostname to s3 endpoint used for image storage. |
 | `s3.bucket` | (none) | Name of S3 bucket used to store images. |
 | `s3.access_key` | (none) | Access key used for authentication. |
-| `s3.secret ` | (none) | Secret Access key used for authentication. |
+| `s3.secret` | (none) | Secret Access key used for authentication. |
 | `s3.max_dimension` | (none) | If set, a resized copy will be created for any image whose dimensions exceed this number. This copy will be served in place of the original. |
 | `s3.upload_headers` | (none) | A map of headers to send with each upload request. For example, DigitalOcean requires the `x-amz-acl` header to be set to `public-read` or it does not make the uploaded images available. |
-| `phash_distance` | 0 | Determines what binary distance is considered a match when querying with a pHash fingeprint. Using more than 8 is not recommended and may lead to large amounts of false positives. **Note**: The [pg-spgist_hamming extension](#phash-distance-matching) must be installed to use distance matching, otherwise you will get errors. |
+| `phash_distance` | 0 | Determines what binary distance is considered a match when querying with a pHash fingerprint. Using more than 8 is not recommended and may lead to large amounts of false positives. **Note**: The [pg-spgist_hamming extension](#phash-distance-matching) must be installed to use distance matching, otherwise you will get errors. |
 | `favicon_path` | (none) | Location where favicons for linked sites should be stored. Leave empty to disable. |
 | `draft_time_limit` | (24h) | Time, in seconds, before a draft is deleted. |
 | `profiler_port` | 0 | Port on which to serve pprof output. Omit to disable entirely. |
+| `port` | 9998 | Port on which the server runs. When using SSL certificates it should be set to `443`. |
 | `postgres.max_open_conns` | (0) | Maximum number of concurrent open connections to the database. |
 | `postgres.max_idle_conns` | (0) | Maximum number of concurrent idle database connections. |
 | `postgres.conn_max_lifetime` | (0) | Maximum lifetime in minutes before a connection is released. |
 | `require_scene_draft` | false | Whether to allow scene creation outside of draft submissions. |
 | `require_tag_role` | false | Whether to require the EditTag role to edit tags. |
 | `csp` | (none) | Contents of the `Content-Security-Policy` header |
+| `autocert.enabled` | (none) | Whether to enable [autocert](#lets-encrypt)|
+| `autocert.cache_dir` | (none) | The directory where autocert certificates are stored. Should be a persisted directory to avoid certificate regeneration on server restart. |
+| `autocert.domain` | (none) | The domain to generate certificates for.|
+| `autocert.email` | (none) | A valid email. Will be submitted to Let's Encrypt, but otherwise not made public. |
+| `mod_audit_retention_days` | 30 | Number of days to retain audit logs of moderator actions. Set `0` to disable. |
 
 ## SSL (HTTPS)
 
-Stash-box is runnable, preferably over HTTPS, for added security, but it requires some setup. You'll need to generate an SSL certificate and key pair to set this up. Or use a TLS terminating proxy of your choice, such as Traefik, Nginx (unsupported), or Caddy Server (unsupported)
+### Let's Encrypt
+
+Stash-box supports automatic certificate generation from Let's Encrypt. If you want to avoid running behind a reverse proxy - which can cause a certain amount of overhead due to image loading - this is the recommended approach.
+
+To use Let's Encrypt, configure the `autocert` config option. As an example:
+```
+autocert:
+    enabled: true
+    cache_dir: /autocert
+    domain: example.org
+    email: email@example.org
+```
+
+To use autocert it needs access to port 80 to respond to Let's Encrypt's challenge. After certificate generation is done, port 80 will redirect to the SSL port.
+
+Stash-box will automatically renew the certificate once it has less than 30 days until expiration.
+
+### Self-signed certificates
 
 Here's an example of how you can do this using OpenSSL:
 
@@ -125,7 +149,7 @@ Once you've generated the certificate and key pair, make sure they're named `sta
 
 ## pHash Distance Matching
 
-If you want to enable distance matching for pHashes in stash-box, you'll need to install the [pg-spgist_hamming](https://github.com/fake-name/pg-spgist_hamming) Postgres extension.
+If you want to enable distance matching for pHashes in stash-box, you'll need to install the [pg-spgist_hamming](https://github.com/infinitestash/pg-spgist_hamming) Postgres extension.
 
 The recommended way to do this is to use the [docker image](docker/production/postgres/Dockerfile). Still, you can also install it manually by following the build instructions in the pg-spgist_hamming repository.
 

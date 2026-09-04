@@ -102,6 +102,15 @@ func (r *Resolver) QueryNotificationsResult() models.QueryNotificationsResultRes
 func (r *Resolver) Notification() models.NotificationResolver {
 	return &notificationResolver{r}
 }
+func (r *Resolver) QueryModAuditsResultType() models.QueryModAuditsResultTypeResolver {
+	return &queryModAuditResolver{r}
+}
+func (r *Resolver) ModAudit() models.ModAuditResolver {
+	return &modAuditResolver{r}
+}
+func (r *Resolver) ClusterSceneSubmission() models.ClusterSceneSubmissionResolver {
+	return &clusterSceneSubmissionResolver{r}
+}
 
 type mutationResolver struct{ *Resolver }
 

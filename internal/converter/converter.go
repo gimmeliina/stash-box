@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid"
+	"github.com/stashapp/stash-box/internal/config"
 	"github.com/stashapp/stash-box/internal/converter/gen"
 	"github.com/stashapp/stash-box/internal/models"
 	"github.com/stashapp/stash-box/internal/queries"
@@ -72,6 +73,16 @@ func StudioToModel(s queries.Studio) models.Studio {
 func StudioToModelPtr(s queries.Studio) *models.Studio {
 	studio := StudioToModel(s)
 	return &studio
+}
+
+// SiteCategoryToModel converts a queries.SiteCategory to a models.SiteCategory
+func SiteCategoryToModel(sc queries.SiteCategory) models.SiteCategory {
+	return modelConverter.ConvertSiteCategory(sc)
+}
+
+func SiteCategoryToModelPtr(sc queries.SiteCategory) *models.SiteCategory {
+	siteCategory := SiteCategoryToModel(sc)
+	return &siteCategory
 }
 
 // TagCategoryToModel converts a queries.TagCategory to a models.TagCategory
@@ -347,6 +358,8 @@ func SiteCreateInputToSite(input models.SiteCreateInput) models.Site {
 		URL:         input.URL,
 		Regex:       input.Regex,
 		ValidTypes:  validTypes,
+		CategoryID:  input.CategoryID,
+		Highlighted: input.Highlighted,
 	}
 }
 
@@ -372,6 +385,9 @@ func UpdateSiteFromUpdateInput(site *models.Site, input models.SiteUpdateInput) 
 		validTypes[i] = string(vt)
 	}
 	site.ValidTypes = validTypes
+
+	site.CategoryID = input.CategoryID
+	site.Highlighted = input.Highlighted
 }
 
 // StudioCreateInputToCreateParams converts a models.StudioCreateInput to a queries.CreateStudioParams
@@ -411,6 +427,46 @@ func UpdateStudioFromUpdateInput(studio queries.Studio, input models.StudioUpdat
 		ID:             studio.ID,
 		Name:           name,
 		ParentStudioID: parentStudioID,
+	}
+}
+
+// SiteCategoryCreateInputToCreateParams converts a models.SiteCategoryCreateInput to a queries.CreateSiteCategoryParams
+func SiteCategoryCreateInputToCreateParams(input models.SiteCategoryCreateInput) queries.CreateSiteCategoryParams {
+	var sortOrder int
+	if input.SortOrder != nil {
+		sortOrder = *input.SortOrder
+	}
+
+	return queries.CreateSiteCategoryParams{
+		Name:        input.Name,
+		Description: input.Description,
+		SortOrder:   sortOrder,
+	}
+}
+
+// UpdateSiteCategoryFromUpdateInput applies changes from models.SiteCategoryUpdateInput to queries.SiteCategory and returns queries.UpdateSiteCategoryParams
+func UpdateSiteCategoryFromUpdateInput(siteCategory queries.SiteCategory, input models.SiteCategoryUpdateInput) queries.UpdateSiteCategoryParams {
+	// Start with existing values
+	name := siteCategory.Name
+	description := siteCategory.Description
+	sortOrder := siteCategory.SortOrder
+
+	// Apply updates from input
+	if input.Name != nil {
+		name = *input.Name
+	}
+	if input.Description != nil {
+		description = input.Description
+	}
+	if input.SortOrder != nil {
+		sortOrder = *input.SortOrder
+	}
+
+	return queries.UpdateSiteCategoryParams{
+		ID:          siteCategory.ID,
+		Name:        name,
+		Description: description,
+		SortOrder:   sortOrder,
 	}
 }
 
@@ -542,7 +598,7 @@ func UpdateUserFromUpdateInput(user queries.User, input models.UserUpdateInput, 
 	}
 }
 
-// CreateUserTokenParamsFromData creates a queries.CreateUserTokenParams with token expiring 15 minutes from now
+// CreateUserTokenParamsFromData creates a queries.CreateUserTokenParams with token expiring based on config
 func CreateUserTokenParamsFromData(tokenType string, data any) (queries.CreateUserTokenParams, error) {
 	id, err := uuid.NewV4()
 	if err != nil {
@@ -555,7 +611,7 @@ func CreateUserTokenParamsFromData(tokenType string, data any) (queries.CreateUs
 	}
 
 	now := time.Now()
-	expires := now.Add(15 * time.Minute)
+	expires := now.Add(config.GetActivationExpiry())
 
 	return queries.CreateUserTokenParams{
 		ID:        id,
@@ -609,6 +665,11 @@ func ScenesToModels(scenes []queries.Scene) []models.Scene {
 // StudiosToModels converts []queries.Studio to []models.Studio
 func StudiosToModels(studios []queries.Studio) []models.Studio {
 	return modelConverter.ConvertStudios(studios)
+}
+
+// SiteCategoriesToModels converts []queries.SiteCategory to []models.SiteCategory
+func SiteCategoriesToModels(siteCategories []queries.SiteCategory) []models.SiteCategory {
+	return modelConverter.ConvertSiteCategories(siteCategories)
 }
 
 // TagCategoriesToModels converts []queries.TagCategory to []models.TagCategory

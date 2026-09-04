@@ -1,14 +1,17 @@
-import * as yup from "yup";
-import { addYears } from "date-fns";
-
 import {
-  GenderEnum,
-  HairColorEnum,
-  EyeColorEnum,
   BreastTypeEnum,
   EthnicityEnum,
+  EyeColorEnum,
+  GenderEnum,
+  HairColorEnum,
 } from "src/graphql";
-import { isValidDate, dateWithinRange } from "src/utils";
+import {
+  isDateInRange,
+  isValidDate,
+  maxBirthdate,
+  maxDeathdate,
+} from "src/utils";
+import * as yup from "yup";
 
 const nullCheck = (input: string | null) =>
   input === "" || input === "null" ? null : input;
@@ -34,7 +37,7 @@ export const PerformerSchema = yup.object({
     })
     .test("valid-date", "Invalid date", isValidDate)
     .test("date-outside-range", "Outside of range", (date) =>
-      dateWithinRange(date, "1900-01-01", addYears(new Date(), -18)),
+      isDateInRange(date, maxBirthdate()),
     )
     .nullable(),
   deathdate: yup
@@ -47,7 +50,7 @@ export const PerformerSchema = yup.object({
     })
     .test("valid-date", "Invalid date", isValidDate)
     .test("date-outside-range", "Outside of range", (date) =>
-      dateWithinRange(date, "1900-01-01", new Date().toISOString().slice(10)),
+      isDateInRange(date, maxDeathdate()),
     )
     .nullable(),
   career_start_year: yup
@@ -69,13 +72,19 @@ export const PerformerSchema = yup.object({
     .min(100, "Invalid height, Height must be in centimeters.")
     .max(230, "Invalid height")
     .nullable(),
-  braSize: yup
+  bandSize: yup
+    .number()
+    .transform(zeroCheck)
+    .min(28, "Size must be 28-56")
+    .max(56, "Size must be 28-56")
+    .nullable(),
+  cupSize: yup
     .string()
     .transform(nullCheck)
-    .matches(
-      /\d{2,3}[a-zA-Z]{1,4}/,
-      "Invalid cup size. Only american sizes are accepted.",
-    )
+    .matches(/^[a-zA-Z]{1,4}$/, {
+      excludeEmptyString: true,
+      message: "Invalid cup size",
+    })
     .nullable(),
   waistSize: yup
     .number()

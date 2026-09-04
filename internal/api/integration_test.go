@@ -23,18 +23,20 @@ import (
 )
 
 // we need to create some users to test the api with, otherwise all calls
-// will be unauthorised
+// will be unauthorized
 type userPopulator struct {
-	none        *models.User
-	read        *models.User
-	admin       *models.User
-	modify      *models.User
-	edit        *models.User
-	noneRoles   []models.RoleEnum
-	readRoles   []models.RoleEnum
-	adminRoles  []models.RoleEnum
-	modifyRoles []models.RoleEnum
-	editRoles   []models.RoleEnum
+	none          *models.User
+	read          *models.User
+	admin         *models.User
+	modify        *models.User
+	moderate      *models.User
+	edit          *models.User
+	noneRoles     []models.RoleEnum
+	readRoles     []models.RoleEnum
+	adminRoles    []models.RoleEnum
+	modifyRoles   []models.RoleEnum
+	moderateRoles []models.RoleEnum
+	editRoles     []models.RoleEnum
 }
 
 var userDB *userPopulator
@@ -73,6 +75,23 @@ func (p *userPopulator) PopulateDB(factory *service.Factory) error {
 
 	p.modify, err = userService.Create(ctx, createInput)
 	p.modifyRoles = createInput.Roles
+
+	if err != nil {
+		return err
+	}
+
+	// create moderate user
+	createInput = models.UserCreateInput{
+		Name:     "moderate",
+		Password: "TestPassword#2024",
+		Roles: []models.RoleEnum{
+			models.RoleEnumModerate,
+		},
+		Email: "moderate@example.com",
+	}
+
+	p.moderate, err = userService.Create(ctx, createInput)
+	p.moderateRoles = createInput.Roles
 
 	if err != nil {
 		return err
@@ -153,9 +172,12 @@ var sceneChecksumSuffix int
 var userSuffix int
 var categorySuffix int
 var siteSuffix int
+var siteCategorySuffix int
 
 func createTestRunner(t *testing.T, u *models.User, roles []models.RoleEnum) *testRunner {
 	resolver := api.NewResolver(*dbtest.Factory())
+
+	au := auth.FromUser(u)
 
 	gqlHandler := handler.NewDefaultServer(models.NewExecutableSchema(models.Config{
 		Resolvers: resolver,
@@ -167,7 +189,7 @@ func createTestRunner(t *testing.T, u *models.User, roles []models.RoleEnum) *te
 	var handlerFunc http.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
 		// re-create context for each request
 		ctx := context.TODO()
-		ctx = context.WithValue(ctx, auth.ContextUser, u)
+		ctx = context.WithValue(ctx, auth.ContextUser, au)
 		ctx = context.WithValue(ctx, auth.ContextRoles, roles)
 		ctx = context.WithValue(ctx, dataloader.GetLoadersKey(), dataloader.GetLoaders(ctx, *dbtest.Factory()))
 		ctx = graphql.WithOperationContext(ctx, &graphql.OperationContext{})
@@ -180,7 +202,7 @@ func createTestRunner(t *testing.T, u *models.User, roles []models.RoleEnum) *te
 
 	// replicate what the server.go code does
 	ctx := context.TODO()
-	ctx = context.WithValue(ctx, auth.ContextUser, u)
+	ctx = context.WithValue(ctx, auth.ContextUser, au)
 	ctx = context.WithValue(ctx, auth.ContextRoles, roles)
 	ctx = context.WithValue(ctx, dataloader.GetLoadersKey(), dataloader.GetLoaders(ctx, *dbtest.Factory()))
 	ctx = graphql.WithOperationContext(ctx, &graphql.OperationContext{})
@@ -195,12 +217,22 @@ func createTestRunner(t *testing.T, u *models.User, roles []models.RoleEnum) *te
 	}
 }
 
+// newRequest discards the dataloader caches, as a new HTTP request would.
+// Needed when a test reads a loader-backed field, mutates, then reads again.
+func (t *testRunner) newRequest() {
+	t.ctx = context.WithValue(t.ctx, dataloader.GetLoadersKey(), dataloader.GetLoaders(t.ctx, *dbtest.Factory()))
+}
+
 func asAdmin(t *testing.T) *testRunner {
 	return createTestRunner(t, userDB.admin, userDB.adminRoles)
 }
 
 func asModify(t *testing.T) *testRunner {
 	return createTestRunner(t, userDB.modify, userDB.modifyRoles)
+}
+
+func asModerate(t *testing.T) *testRunner {
+	return createTestRunner(t, userDB.moderate, userDB.moderateRoles)
 }
 
 func asRead(t *testing.T) *testRunner {
@@ -551,20 +583,20 @@ func (s *testRunner) createTestStudioEdit(operation models.OperationEnum, detail
 	return createdEdit, nil
 }
 
-func (s *testRunner) applyEdit(id uuid.UUID) (*models.Edit, error) {
+func (s *testRunner) approveEdit(id uuid.UUID) (*models.Edit, error) {
 	s.t.Helper()
 
-	input := models.ApplyEditInput{
+	input := models.ApproveEditInput{
 		ID: id,
 	}
-	appliedEdit, err := s.resolver.Mutation().ApplyEdit(s.ctx, input)
+	approvedEdit, err := s.resolver.Mutation().ApproveEdit(s.ctx, input)
 
 	if err != nil {
-		s.t.Errorf("Error applying edit: %s", err.Error())
+		s.t.Errorf("Error approving edit: %s", err.Error())
 		return nil, err
 	}
 
-	return appliedEdit, nil
+	return approvedEdit, nil
 }
 
 func (s *testRunner) getEditTagDetails(input *models.Edit) *models.TagEdit {
@@ -927,6 +959,33 @@ func (s *testRunner) getEditSceneTarget(input *models.Edit) *models.Scene {
 	target, _ := r.Target(s.ctx, input)
 	sceneTarget := target.(*models.Scene)
 	return sceneTarget
+}
+
+func (s *testRunner) generateSiteCategoryName() string {
+	siteCategorySuffix += 1
+	return "site-category-" + strconv.Itoa(siteCategorySuffix)
+}
+
+func (s *testRunner) createTestSiteCategory(input *models.SiteCategoryCreateInput) (*models.SiteCategory, error) {
+	s.t.Helper()
+
+	if input == nil {
+		name := s.generateSiteCategoryName()
+		desc := "Description for " + name
+		input = &models.SiteCategoryCreateInput{
+			Name:        name,
+			Description: &desc,
+		}
+	}
+
+	createdCategory, err := s.resolver.Mutation().SiteCategoryCreate(s.ctx, *input)
+
+	if err != nil {
+		s.t.Errorf("Error creating site category: %s", err.Error())
+		return nil, err
+	}
+
+	return createdCategory, nil
 }
 
 func (s *testRunner) generateSiteName() string {

@@ -33,6 +33,11 @@ func (s *Performer) WithTxn(fn func(*queries.Queries) error) error {
 	return s.withTxn(fn)
 }
 
+func (s *Performer) RefreshPopularityAllTime(ctx context.Context) error {
+	_, err := s.queries.DB().Exec(ctx, "REFRESH MATERIALIZED VIEW CONCURRENTLY performer_popularity_all_time")
+	return err
+}
+
 // Queries
 
 func (s *Performer) FindByID(ctx context.Context, id uuid.UUID) (*models.Performer, error) {
@@ -60,7 +65,7 @@ func (s *Performer) FindByAlias(ctx context.Context, alias string) (*models.Perf
 }
 
 // Dataloader for performers
-func (s *Performer) LoadByIds(ctx context.Context, ids []uuid.UUID) ([]*models.Performer, []error) {
+func (s *Performer) LoadIds(ctx context.Context, ids []uuid.UUID) ([]*models.Performer, []error) {
 	if len(ids) == 0 {
 		return make([]*models.Performer, 0), nil
 	}
@@ -507,44 +512,80 @@ func (s *Performer) SearchPerformer(ctx context.Context, term string, limit *int
 		}
 	}
 
-	rows, err := s.queries.SearchPerformersWithFacets(ctx, queries.SearchPerformersWithFacetsParams{
-		Term:         &trimmedQuery,
-		Limit:        int32(searchLimit),
-		Offset:       int32(searchOffset),
-		FilterGender: filterGender,
+	return &models.PerformerQuery{
+		Search: &models.PerformerSearchParams{
+			Term:         trimmedQuery,
+			FilterGender: filterGender,
+			Limit:        searchLimit,
+			Offset:       searchOffset,
+		},
+	}, nil
+}
+
+// bm25Search wraps a ParadeDB BM25 query in a tx with plan_cache_mode=
+// force_custom_plan. Without this the planner switches to a generic plan
+// after 5 prepared-statement executes and pdb.score() fails with
+// "Unsupported query shape".
+func bm25Search[T any](ctx context.Context, s *Performer, fn func(*queries.Queries) (T, error)) (T, error) {
+	var out T
+	err := s.withTxn(func(q *queries.Queries) error {
+		if _, err := q.DB().Exec(ctx, "SET LOCAL plan_cache_mode = force_custom_plan"); err != nil {
+			return err
+		}
+		var err error
+		out, err = fn(q)
+		return err
+	})
+	return out, err
+}
+
+func (s *Performer) SearchPerformerPage(ctx context.Context, params *models.PerformerSearchParams) ([]models.Performer, error) {
+	ids, err := bm25Search(ctx, s, func(q *queries.Queries) ([]uuid.UUID, error) {
+		return q.SearchPerformers(ctx, queries.SearchPerformersParams{
+			Term:         params.Term,
+			FilterGender: params.FilterGender,
+			Limit:        int32(params.Limit),
+			Offset:       int32(params.Offset),
+		})
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	ids := make([]uuid.UUID, len(rows))
-	for i, row := range rows {
-		ids[i] = row.PerformerID
-	}
-
-	performerPtrs, _ := s.LoadByIds(ctx, ids)
+	performerPtrs, _ := s.LoadIds(ctx, ids)
 	performers := make([]models.Performer, 0, len(performerPtrs))
 	for _, p := range performerPtrs {
 		if p != nil {
 			performers = append(performers, *p)
 		}
 	}
+	return performers, nil
+}
 
-	// Parse facets and count from the first row (all rows have the same aggregated values)
-	var facets *models.PerformerSearchFacets
-	count := 0
-	if len(rows) > 0 {
-		facets = parsePerformerFacets(rows[0].GenderFacets)
-		count = parseParadeDBCount(rows[0].TotalCount)
+func (s *Performer) SearchPerformerCount(ctx context.Context, params *models.PerformerSearchParams) (int, error) {
+	raw, err := bm25Search(ctx, s, func(q *queries.Queries) (interface{}, error) {
+		return q.CountPerformerSearchMatches(ctx, queries.CountPerformerSearchMatchesParams{
+			Term:         params.Term,
+			FilterGender: params.FilterGender,
+		})
+	})
+	if err != nil {
+		return 0, err
 	}
+	return parseParadeDBCount(raw), nil
+}
 
-	return &models.PerformerQuery{
-		SearchResults: &models.PerformerSearchResults{
-			Performers: performers,
-			Count:      count,
-			Facets:     facets,
-		},
-	}, nil
+func (s *Performer) SearchPerformerFacets(ctx context.Context, params *models.PerformerSearchParams) (*models.PerformerSearchFacets, error) {
+	raw, err := bm25Search(ctx, s, func(q *queries.Queries) (interface{}, error) {
+		return q.GetPerformerSearchFacets(ctx, queries.GetPerformerSearchFacetsParams{
+			Term:         params.Term,
+			FilterGender: params.FilterGender,
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parsePerformerFacets(raw), nil
 }
 
 type paradeDBCountResult struct {

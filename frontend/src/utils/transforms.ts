@@ -17,8 +17,8 @@ export const formatMeasurements = ({
   waist_size?: number | null;
   hip_size?: number | null;
 }): string | undefined => {
-  if ((cup_size && band_size) || hip_size || waist_size) {
-    const bust = cup_size && band_size ? `${band_size}${cup_size}` : "??";
+  if (cup_size || band_size || hip_size || waist_size) {
+    const bust = `${band_size ?? "?"}${cup_size ?? "?"}`;
     return `${bust}-${waist_size ?? "??"}-${hip_size ?? "??"}`;
   }
   return undefined;
@@ -34,36 +34,6 @@ type Image = {
   url: string;
   width: number;
   height: number;
-};
-
-export const sortImageURLs = (
-  urls: Image[],
-  orientation: "portrait" | "landscape",
-) =>
-  urls
-    .map((u) => ({
-      ...u,
-      aspect:
-        orientation === "portrait"
-          ? u.height / u.width > 1
-          : u.width / u.height > 1,
-    }))
-    .sort((a, b) => {
-      if (a.aspect > b.aspect) return -1;
-      if (a.aspect < b.aspect) return 1;
-      if (orientation === "portrait" && a.height > b.height) return -1;
-      if (orientation === "portrait" && a.height < b.height) return 1;
-      if (orientation === "landscape" && a.width > b.width) return -1;
-      if (orientation === "landscape" && a.width < b.width) return 1;
-      return 0;
-    });
-
-export const getImage = (
-  urls: Image[],
-  orientation: "portrait" | "landscape",
-) => {
-  const images = sortImageURLs(urls, orientation);
-  return images?.[0]?.url;
 };
 
 export const imageType = (image?: Image) => {

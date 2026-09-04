@@ -6,13 +6,12 @@ import type {
 import type { PerformerFragment } from "src/graphql";
 import {
   breastType,
-  ethnicityEnum,
-  genderEnum,
   diffArray,
-  diffValue,
   diffImages,
   diffURLs,
-  parseBraSize,
+  diffValue,
+  ethnicityEnum,
+  genderEnum,
 } from "src/utils";
 
 import type { PerformerFormData } from "./schema";
@@ -61,7 +60,8 @@ const selectPerformerDetails = (
     original?.aliases ?? [],
     (a) => a,
   );
-  const [newCupSize, newBandSize] = parseBraSize(data.braSize ?? "");
+  const newCupSize = data.cupSize?.toUpperCase() ?? null;
+  const newBandSize = data.bandSize ?? null;
 
   return [
     {

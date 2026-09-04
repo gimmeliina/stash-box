@@ -1,49 +1,48 @@
+import { faCheck, faEdit, faXmark } from "@fortawesome/free-solid-svg-icons";
 import type { FC } from "react";
 import { Col, Row } from "react-bootstrap";
-import { faCheck, faXmark, faEdit } from "@fortawesome/free-solid-svg-icons";
-
-import type {
-  FingerprintAlgorithm,
-  PerformerFragment,
-  GenderEnum,
-  EthnicityEnum,
-  BreastTypeEnum,
-  EditFragment,
-  HairColorEnum,
-  EyeColorEnum,
-} from "src/graphql";
-import {
-  formatDuration,
-  getCountryByISO,
-  isTagEdit,
-  isPerformerEdit,
-  formatBodyModification,
-  isStudioEdit,
-  isSceneEdit,
-  studioHref,
-  categoryHref,
-  compareByName,
-} from "src/utils";
-import {
-  EthnicityTypes,
-  HairColorTypes,
-  EyeColorTypes,
-  BreastTypes,
-  GenderTypes,
-} from "src/constants";
-import { Icon } from "src/components/fragments";
 import ChangeRow from "src/components/changeRow";
+import { Icon } from "src/components/fragments";
 import ImageChangeRow from "src/components/imageChangeRow";
 import URLChangeRow, { type URL } from "src/components/urlChangeRow";
+import {
+  BreastTypes,
+  EthnicityTypes,
+  EyeColorTypes,
+  GenderTypes,
+  HairColorTypes,
+} from "src/constants";
+import type {
+  BreastTypeEnum,
+  EditFragment,
+  EthnicityEnum,
+  EyeColorEnum,
+  FingerprintAlgorithm,
+  GenderEnum,
+  HairColorEnum,
+  PerformerFragment,
+} from "src/graphql";
+import {
+  categoryHref,
+  compareByName,
+  formatBodyModification,
+  formatDuration,
+  getCountryByISO,
+  isPerformerEdit,
+  isSceneEdit,
+  isStudioEdit,
+  isTagEdit,
+  studioHref,
+} from "src/utils";
 import LinkedChangeRow from "../linkedChangeRow";
 import ListChangeRow from "../listChangeRow";
-import { renderPerformer, renderTag, renderFingerprint } from "./renderEntity";
+import { renderFingerprint, renderPerformer, renderTag } from "./renderEntity";
 
 type Details = EditFragment["details"];
 type OldDetails = EditFragment["old_details"];
 type Options = EditFragment["options"];
 
-type Image = {
+export type Image = {
   height: number;
   id: string;
   url: string;
@@ -52,7 +51,7 @@ type Image = {
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 type StartingWith<T, K extends string> = T extends `${K}${infer _}` ? T : never;
-type TargetOldDetails<T> = Omit<
+export type TargetOldDetails<T> = Omit<
   T,
   StartingWith<keyof T, "added_" | "removed_"> | "draft_id"
 >;
@@ -106,7 +105,7 @@ export const renderTagDetails = (
   </>
 );
 
-type BodyMod = {
+export type BodyMod = {
   location: string;
   description?: string | null;
 };

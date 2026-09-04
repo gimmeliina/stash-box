@@ -31,6 +31,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"github.com/rs/cors"
 	"github.com/stashapp/stash-box/internal/auth"
+	"github.com/stashapp/stash-box/internal/autocert"
 	"github.com/stashapp/stash-box/internal/config"
 	"github.com/stashapp/stash-box/internal/dataloader"
 	"github.com/stashapp/stash-box/internal/models"
@@ -46,7 +47,7 @@ var buildtype string
 
 const APIKeyHeader = "ApiKey"
 
-func getUserAndRoles(ctx context.Context, fac service.Factory, userID string) (*models.User, []models.RoleEnum, error) {
+func getUserAndRoles(ctx context.Context, fac service.Factory, userID string) (*auth.AuthUser, []models.RoleEnum, error) {
 	if userID == "" {
 		return nil, nil, nil
 	}
@@ -54,23 +55,28 @@ func getUserAndRoles(ctx context.Context, fac service.Factory, userID string) (*
 	if err != nil {
 		return nil, nil, err
 	}
-	u, err := fac.User().FindByID(ctx, id)
+	if u, roles, ok := auth.CacheGet(id); ok {
+		return u, roles, nil
+	}
+	u, roles, err := fac.User().FindWithRoles(ctx, id)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	roles, err := fac.User().GetRoles(ctx, id)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return u, roles, nil
+	au := auth.FromUser(u)
+	auth.CacheSet(au, roles)
+	return au, roles, nil
 }
 
 func authenticateHandler(fac service.Factory) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
+
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
+					span.SetAttributes(attribute.String("http.request.header.origin", origin))
+				}
+			}
 
 			// translate api key into current user, if present
 			userID := ""
@@ -83,18 +89,15 @@ func authenticateHandler(fac service.Factory) func(http.Handler) http.Handler {
 				userID, err = getSessionUserID(w, r)
 			}
 
-			var u *models.User
+			var u *auth.AuthUser
 			var roles []models.RoleEnum
 			if err == nil {
 				u, roles, err = getUserAndRoles(ctx, fac, userID)
 			}
 
 			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				_, err = w.Write([]byte(err.Error()))
-				if err != nil {
-					logger.Error(err)
-				}
+				logger.Debugf("auth rejected: %v", err)
+				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
 
@@ -178,7 +181,7 @@ func Start(fac service.Factory, ui embed.FS) {
 	gqlSrv.AddTransport(gqlTransport.POST{})
 	gqlSrv.AddTransport(gqlTransport.MultipartForm{})
 	gqlSrv.Use(gqlExtension.Introspection{})
-	gqlSrv.Use(otelgqlgen.Middleware(otelgqlgen.WithCreateSpanFromFields(func(fieldCtx *graphql.FieldContext) bool { return fieldCtx.IsResolver })))
+	gqlSrv.Use(otelgqlgen.Middleware(otelgqlgen.WithCreateSpanFromFields(func(*graphql.FieldContext) bool { return false })))
 	gqlSrv.SetErrorPresenter(func(ctx context.Context, e error) *gqlerror.Error {
 		err := graphql.DefaultErrorPresenter(ctx, e)
 
@@ -198,6 +201,21 @@ func Start(fac service.Factory, ui embed.FS) {
 
 	if !config.GetIsProduction() {
 		r.Handle("/playground", gqlPlayground.Handler("GraphQL playground", "/graphql"))
+	}
+
+	mountedPrefixes := make(map[string]bool)
+	for _, fe := range config.GetFrontends() {
+		if fe.Path == "" || fe.Prefix == "" || fe.Prefix == "/" {
+			logger.Warnf("skipping frontend with missing path/prefix or reserved prefix: %+v", fe)
+			continue
+		}
+		if mountedPrefixes[fe.Prefix] {
+			logger.Warnf("skipping frontend with duplicate prefix %s", fe.Prefix)
+			continue
+		}
+		mountedPrefixes[fe.Prefix] = true
+		r.Mount(fe.Prefix, frontendRoutes{dir: fe.Path, prefix: fe.Prefix}.Routes())
+		logger.Infof("serving frontend from %s at %s", fe.Path, fe.Prefix)
 	}
 
 	r.Mount("/", rootRoutes{ui: ui}.Routes(fac))
@@ -222,6 +240,33 @@ func Start(fac service.Factory, ui embed.FS) {
 	}
 
 	address := config.GetHost() + ":" + strconv.Itoa(config.GetPort())
+
+	// Priority 1: Autocert (Let's Encrypt)
+	if tlsConfig := autocert.Init(); tlsConfig != nil {
+		httpsServer := &http.Server{
+			Addr:      address,
+			Handler:   r,
+			TLSConfig: tlsConfig,
+		}
+
+		// Start HTTP server for ACME HTTP-01 challenges on port 80
+		// Non-challenge requests are redirected to HTTPS
+		go func() {
+			logger.Infof("Starting HTTP server on %s:80 for ACME challenges", config.GetHost())
+			if err := http.ListenAndServe(config.GetHost()+":80", autocert.HTTPHandler(http.HandlerFunc(redirect))); err != nil {
+				logger.Errorf("HTTP server error: %v", err)
+			}
+		}()
+
+		go func() {
+			printVersion()
+			logger.Infof("stash-box is running on HTTPS (autocert) at https://%s/", address)
+			logger.Fatal(httpsServer.ListenAndServeTLS("", ""))
+		}()
+		return
+	}
+
+	// Priority 2: File-based TLS
 	if tlsConfig := makeTLSConfig(); tlsConfig != nil {
 		httpsServer := &http.Server{
 			Addr:      address,
@@ -240,18 +285,20 @@ func Start(fac service.Factory, ui embed.FS) {
 			logger.Infof("stash-box is running on HTTPS at https://%s/", address)
 			logger.Fatal(httpsServer.ListenAndServeTLS("", ""))
 		}()
-	} else {
-		server := &http.Server{
-			Addr:    address,
-			Handler: r,
-		}
-
-		go func() {
-			printVersion()
-			logger.Infof("stash-box is running on HTTP at http://%s/", address)
-			logger.Fatal(server.ListenAndServe())
-		}()
+		return
 	}
+
+	// Priority 3: HTTP only
+	server := &http.Server{
+		Addr:    address,
+		Handler: r,
+	}
+
+	go func() {
+		printVersion()
+		logger.Infof("stash-box is running on HTTP at http://%s/", address)
+		logger.Fatal(server.ListenAndServe())
+	}()
 }
 
 func printVersion() {

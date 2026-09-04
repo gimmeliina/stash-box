@@ -1,12 +1,13 @@
 import {
   ApolloClient,
-  InMemoryCache,
   ApolloLink,
+  CombinedGraphQLErrors,
+  InMemoryCache,
+  ServerError,
   type TypePolicies,
 } from "@apollo/client";
-import { ErrorLink } from "@apollo/client/link/error";
-import { CombinedGraphQLErrors, ServerError } from "@apollo/client";
 import { SetContextLink } from "@apollo/client/link/context";
+import { ErrorLink } from "@apollo/client/link/error";
 import { RemoveTypenameFromVariablesLink } from "@apollo/client/link/remove-typename";
 import UploadHttpLink from "apollo-upload-client/UploadHttpLink.mjs";
 
@@ -16,6 +17,20 @@ const typePolicies: TypePolicies = {
   },
   PerformerDraft: {
     keyFields: false,
+  },
+  Studio: {
+    fields: {
+      sub_studios: {
+        keyArgs: ["input"],
+      },
+    },
+  },
+  Query: {
+    fields: {
+      findStudio: {
+        merge: true,
+      },
+    },
   },
 };
 

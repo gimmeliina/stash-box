@@ -23,12 +23,14 @@ type performerAppearance struct {
 }
 
 type fingerprint struct {
-	Hash        string                      `json:"hash"`
-	Algorithm   models.FingerprintAlgorithm `json:"algorithm"`
-	Duration    int                         `json:"duration"`
-	Submissions int                         `json:"submissions"`
-	Created     string                      `json:"created"`
-	Updated     string                      `json:"updated"`
+	Hash         string                      `json:"hash"`
+	Algorithm    models.FingerprintAlgorithm `json:"algorithm"`
+	Duration     int                         `json:"duration"`
+	Submissions  int                         `json:"submissions"`
+	Reports      int                         `json:"reports"`
+	UserReported bool                        `json:"user_reported"`
+	Created      string                      `json:"created"`
+	Updated      string                      `json:"updated"`
 }
 
 // FingerprintHash returns the Hash as a models.FingerprintHash
@@ -171,6 +173,18 @@ func (tc tagCategoryOutput) UUID() uuid.UUID {
 type queryTagCategoriesResultType struct {
 	Count         int                 `json:"count"`
 	TagCategories []tagCategoryOutput `json:"tag_categories"`
+}
+
+type siteCategoryOutput struct {
+	ID          int     `json:"id"`
+	Name        string  `json:"name"`
+	Description *string `json:"description"`
+	SortOrder   int     `json:"sort_order"`
+}
+
+type querySiteCategoriesResultType struct {
+	Count          int                  `json:"count"`
+	SiteCategories []siteCategoryOutput `json:"site_categories"`
 }
 
 type userOutput struct {
@@ -520,6 +534,78 @@ func (c *graphqlClient) findPerformer(id uuid.UUID) (*performerOutput, error) {
 	return resp.FindPerformer, nil
 }
 
+func (c *graphqlClient) findPerformers(ids []uuid.UUID) ([]*performerOutput, error) {
+	q := `
+	query FindPerformers($ids: [ID!]!) {
+		findPerformers(ids: $ids) {
+			` + makeFragment(reflect.TypeOf(performerOutput{})) + `
+		}
+	}`
+
+	var resp struct {
+		FindPerformers []*performerOutput
+	}
+	if err := c.Post(q, &resp, client.Var("ids", ids)); err != nil {
+		return nil, err
+	}
+
+	return resp.FindPerformers, nil
+}
+
+func (c *graphqlClient) findStudios(ids []uuid.UUID) ([]*studioOutput, error) {
+	q := `
+	query FindStudios($ids: [ID!]!) {
+		findStudios(ids: $ids) {
+			` + makeFragment(reflect.TypeOf(studioOutput{})) + `
+		}
+	}`
+
+	var resp struct {
+		FindStudios []*studioOutput
+	}
+	if err := c.Post(q, &resp, client.Var("ids", ids)); err != nil {
+		return nil, err
+	}
+
+	return resp.FindStudios, nil
+}
+
+func (c *graphqlClient) findTags(ids []uuid.UUID) ([]*tagOutput, error) {
+	q := `
+	query FindTags($ids: [ID!]!) {
+		findTags(ids: $ids) {
+			` + makeFragment(reflect.TypeOf(tagOutput{})) + `
+		}
+	}`
+
+	var resp struct {
+		FindTags []*tagOutput
+	}
+	if err := c.Post(q, &resp, client.Var("ids", ids)); err != nil {
+		return nil, err
+	}
+
+	return resp.FindTags, nil
+}
+
+func (c *graphqlClient) findScenes(ids []uuid.UUID) ([]*sceneOutput, error) {
+	q := `
+	query FindScenes($ids: [ID!]!) {
+		findScenes(ids: $ids) {
+			` + makeFragment(reflect.TypeOf(sceneOutput{})) + `
+		}
+	}`
+
+	var resp struct {
+		FindScenes []*sceneOutput
+	}
+	if err := c.Post(q, &resp, client.Var("ids", ids)); err != nil {
+		return nil, err
+	}
+
+	return resp.FindScenes, nil
+}
+
 func (c *graphqlClient) createStudio(input models.StudioCreateInput) (*studioOutput, error) {
 	q := `
 	mutation StudioCreate($input: StudioCreateInput!) {
@@ -714,6 +800,24 @@ func (c *graphqlClient) queryTagCategories() (*queryTagCategoriesResultType, err
 	}
 
 	return resp.QueryTagCategories, nil
+}
+
+func (c *graphqlClient) querySiteCategories() (*querySiteCategoriesResultType, error) {
+	q := `
+	query QuerySiteCategories {
+		querySiteCategories {
+			` + makeFragment(reflect.TypeOf(querySiteCategoriesResultType{})) + `
+		}
+	}`
+
+	var resp struct {
+		QuerySiteCategories *querySiteCategoriesResultType
+	}
+	if err := c.Post(q, &resp); err != nil {
+		return nil, err
+	}
+
+	return resp.QuerySiteCategories, nil
 }
 
 func (c *graphqlClient) findTagOrAlias(name string) (*tagOutput, error) {
@@ -932,17 +1036,20 @@ func (c *graphqlClient) queryNotifications(input models.QueryNotificationsInput)
 	return &resp.QueryNotifications, nil
 }
 
-func (c *graphqlClient) getUnreadNotificationCount() (int, error) {
+func (c *graphqlClient) getUnreadNotificationCount() (models.UnreadNotificationCount, error) {
 	q := `
 	query GetUnreadNotificationCount {
-		getUnreadNotificationCount
+		getUnreadNotificationCount {
+			total
+			urgent
+		}
 	}`
 
 	var resp struct {
-		GetUnreadNotificationCount int
+		GetUnreadNotificationCount models.UnreadNotificationCount
 	}
 	if err := c.Post(q, &resp); err != nil {
-		return 0, err
+		return models.UnreadNotificationCount{}, err
 	}
 
 	return resp.GetUnreadNotificationCount, nil
@@ -998,4 +1105,80 @@ func (c *graphqlClient) getNotificationSubscriptions() ([]models.NotificationEnu
 	}
 
 	return resp.Me.NotificationSubscriptions, nil
+}
+
+func (c *graphqlClient) deleteEdit(input models.DeleteEditInput) (bool, error) {
+	q := `
+	mutation DeleteEdit($input: DeleteEditInput!) {
+		deleteEdit(input: $input)
+	}`
+
+	var resp struct {
+		DeleteEdit bool
+	}
+	if err := c.Post(q, &resp, client.Var("input", input)); err != nil {
+		return false, err
+	}
+
+	return resp.DeleteEdit, nil
+}
+
+func (c *graphqlClient) amendEdit(input models.AmendEditInput) (bool, error) {
+	q := `
+	mutation AmendEdit($input: AmendEditInput!) {
+		amendEdit(input: $input) {
+			id
+		}
+	}`
+
+	var resp struct {
+		AmendEdit struct {
+			ID uuid.UUID
+		}
+	}
+	if err := c.Post(q, &resp, client.Var("input", input)); err != nil {
+		return false, err
+	}
+
+	return resp.AmendEdit.ID != uuid.Nil, nil
+}
+
+func (c *graphqlClient) updateEditComment(input models.UpdateEditCommentInput) (uuid.UUID, error) {
+	q := `
+	mutation UpdateEditComment($input: UpdateEditCommentInput!) {
+		updateEditComment(input: $input) {
+			id
+		}
+	}`
+
+	var resp struct {
+		UpdateEditComment struct {
+			ID uuid.UUID
+		}
+	}
+	if err := c.Post(q, &resp, client.Var("input", input)); err != nil {
+		return uuid.Nil, err
+	}
+
+	return resp.UpdateEditComment.ID, nil
+}
+
+func (c *graphqlClient) hideEditComment(input models.HideEditCommentInput) (uuid.UUID, error) {
+	q := `
+	mutation HideEditComment($input: HideEditCommentInput!) {
+		hideEditComment(input: $input) {
+			id
+		}
+	}`
+
+	var resp struct {
+		HideEditComment struct {
+			ID uuid.UUID
+		}
+	}
+	if err := c.Post(q, &resp, client.Var("input", input)); err != nil {
+		return uuid.Nil, err
+	}
+
+	return resp.HideEditComment.ID, nil
 }

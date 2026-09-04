@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/gofrs/uuid"
 	"github.com/stashapp/stash-box/internal/models"
@@ -226,7 +227,7 @@ func (s *performerTestRunner) testUpdatePerformer() {
 		},
 	}
 
-	// need some mocking of the context to make the field ignore behaviour work
+	// need some mocking of the context to make the field ignore behavior work
 	ctx := s.updateContext([]string{
 		"aliases",
 		"urls",
@@ -510,61 +511,70 @@ func TestDestroyPerformer(t *testing.T) {
 }
 
 func (s *performerTestRunner) testQueryPerformersByAgeAndBirthYear() {
-	// Create test performers with specific birthdates
-	birthdate1995 := "1995-06-15"
-	birthdate2000 := "2000-03-20"
-	birthdate2005 := "2005-08-10"
-	deathdate2020 := "2020-04-19"
+	// Use relative dates based on current time so tests don't break as time passes
+	now := time.Now()
+	currentYear := now.Year()
 
-	// Create performer born in 1995 (alive, currently 30 years old in 2025)
+	// Calculate birthdates for specific ages (use January 1st to ensure birthday has passed)
+	birthYear30 := currentYear - 30
+	birthYear25 := currentYear - 25
+	birthYear20 := currentYear - 20
+
+	birthdate30YearsAgo := time.Date(birthYear30, 1, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+	birthdate25YearsAgo := time.Date(birthYear25, 1, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+	birthdate20YearsAgo := time.Date(birthYear20, 1, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+	// Death date 5 years ago (so performer born 25 years ago died at age 20)
+	deathdate5YearsAgo := time.Date(currentYear-5, 4, 19, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+
+	// Create performer age 30 (alive)
 	name1 := s.generatePerformerName()
 	performer1, err := s.createTestPerformer(&models.PerformerCreateInput{
 		Name:      name1,
-		Birthdate: &birthdate1995,
+		Birthdate: &birthdate30YearsAgo,
 	})
 	assert.NoError(s.t, err)
 
-	// Create performer born in 2000 (alive, currently 25 years old in 2025)
+	// Create performer age 25 (alive)
 	name2 := s.generatePerformerName()
 	performer2, err := s.createTestPerformer(&models.PerformerCreateInput{
 		Name:      name2,
-		Birthdate: &birthdate2000,
+		Birthdate: &birthdate25YearsAgo,
 	})
 	assert.NoError(s.t, err)
 
-	// Create performer born in 2000 but died in 2020 (age at death: 20)
+	// Create performer born 25 years ago but died 5 years ago (age at death: 20)
 	name3 := s.generatePerformerName()
 	performer3, err := s.createTestPerformer(&models.PerformerCreateInput{
 		Name:      name3,
-		Birthdate: &birthdate2000,
-		Deathdate: &deathdate2020,
+		Birthdate: &birthdate25YearsAgo,
+		Deathdate: &deathdate5YearsAgo,
 	})
 	assert.NoError(s.t, err)
 
-	// Create performer born in 2005 (alive, currently 20 years old in 2025)
+	// Create performer age 20 (alive)
 	name4 := s.generatePerformerName()
 	performer4, err := s.createTestPerformer(&models.PerformerCreateInput{
 		Name:      name4,
-		Birthdate: &birthdate2005,
+		Birthdate: &birthdate20YearsAgo,
 	})
 	assert.NoError(s.t, err)
 
-	// Test birth_year filter: query for performers born in 2000
-	birthYear2000 := &models.IntCriterionInput{
-		Value:    2000,
+	// Test birth_year filter: query for performers born in birthYear25
+	birthYearFilter25 := &models.IntCriterionInput{
+		Value:    birthYear25,
 		Modifier: models.CriterionModifierEquals,
 	}
 	result, err := s.client.queryPerformers(models.PerformerQueryInput{
-		BirthYear: birthYear2000,
+		BirthYear: birthYearFilter25,
 		Page:      1,
 		PerPage:   100,
 		Direction: models.SortDirectionEnumAsc,
 		Sort:      models.PerformerSortEnumName,
 	})
 	assert.NoError(s.t, err, "Error querying performers by birth year")
-	assert.True(s.t, result.Count >= 2, "Expected at least 2 performers born in 2000")
+	assert.True(s.t, result.Count >= 2, "Expected at least 2 performers born in year %d", birthYear25)
 
-	// Verify both performers born in 2000 are in results
+	// Verify both performers born in birthYear25 are in results
 	found2 := false
 	found3 := false
 	for _, p := range result.Performers {
@@ -575,34 +585,34 @@ func (s *performerTestRunner) testQueryPerformersByAgeAndBirthYear() {
 			found3 = true
 		}
 	}
-	assert.True(s.t, found2, "Performer born in 2000 (alive) not found")
-	assert.True(s.t, found3, "Performer born in 2000 (deceased) not found")
+	assert.True(s.t, found2, "Performer born in %d (alive) not found", birthYear25)
+	assert.True(s.t, found3, "Performer born in %d (deceased) not found", birthYear25)
 
-	// Test birth_year filter: query for performers born in 1995
-	birthYear1995 := &models.IntCriterionInput{
-		Value:    1995,
+	// Test birth_year filter: query for performers born in birthYear30
+	birthYearFilter30 := &models.IntCriterionInput{
+		Value:    birthYear30,
 		Modifier: models.CriterionModifierEquals,
 	}
 	result, err = s.client.queryPerformers(models.PerformerQueryInput{
-		BirthYear: birthYear1995,
+		BirthYear: birthYearFilter30,
 		Page:      1,
 		PerPage:   100,
 		Direction: models.SortDirectionEnumAsc,
 		Sort:      models.PerformerSortEnumName,
 	})
-	assert.NoError(s.t, err, "Error querying performers by birth year 1995")
-	assert.True(s.t, result.Count >= 1, "Expected at least 1 performer born in 1995")
+	assert.NoError(s.t, err, "Error querying performers by birth year %d", birthYear30)
+	assert.True(s.t, result.Count >= 1, "Expected at least 1 performer born in %d", birthYear30)
 
-	// Verify performer born in 1995 is in results
+	// Verify performer born in birthYear30 is in results
 	found1 := false
 	for _, p := range result.Performers {
 		if p.ID == performer1.ID {
 			found1 = true
 		}
 	}
-	assert.True(s.t, found1, "Performer born in 1995 not found")
+	assert.True(s.t, found1, "Performer born in %d not found", birthYear30)
 
-	// Test age filter: query for performers age 25 (born in 2000, still alive)
+	// Test age filter: query for performers age 25 (still alive)
 	age25 := &models.IntCriterionInput{
 		Value:    25,
 		Modifier: models.CriterionModifierEquals,
@@ -821,4 +831,135 @@ func TestQueryPerformersByAgeAndBirthYear(t *testing.T) {
 func TestQueryPerformersSceneCountSort(t *testing.T) {
 	pt := createPerformerTestRunner(t)
 	pt.testQueryPerformersSceneCountSort()
+}
+
+// testQueryPerformersSharedSceneCountSort verifies that SHARED_SCENE_COUNT ranks
+// co-performers by scenes in common rather than by their total scene count
+func (s *performerTestRunner) testQueryPerformersSharedSceneCountSort() {
+	subject, err := s.createTestPerformer(nil)
+	assert.NoError(s.t, err)
+
+	// The partner sharing fewer scenes has the larger overall scene count, so
+	// SCENE_COUNT and SHARED_SCENE_COUNT must disagree on the ordering
+	frequent, err := s.createTestPerformer(nil)
+	assert.NoError(s.t, err)
+	occasional, err := s.createTestPerformer(nil)
+	assert.NoError(s.t, err)
+
+	createScene := func(performers ...uuid.UUID) {
+		appearances := make([]models.PerformerAppearanceInput, len(performers))
+		for i, id := range performers {
+			appearances[i] = models.PerformerAppearanceInput{PerformerID: id}
+		}
+		title := s.generateSceneName()
+		_, err := s.createTestScene(&models.SceneCreateInput{
+			Title:      &title,
+			Date:       "2020-01-15",
+			Performers: appearances,
+		})
+		assert.NoError(s.t, err)
+	}
+
+	for range 2 {
+		createScene(subject.UUID(), frequent.UUID())
+	}
+	createScene(subject.UUID(), occasional.UUID())
+	for range 5 {
+		createScene(occasional.UUID())
+	}
+
+	subjectID := subject.UUID()
+	indexOf := func(sort models.PerformerSortEnum, id string) int {
+		result, err := s.client.queryPerformers(models.PerformerQueryInput{
+			PerformedWith: &subjectID,
+			Page:          1,
+			PerPage:       100,
+			Direction:     models.SortDirectionEnumDesc,
+			Sort:          sort,
+		})
+		assert.NoError(s.t, err)
+		for i, p := range result.Performers {
+			if p.ID == id {
+				return i
+			}
+		}
+		return -1
+	}
+
+	sharedFrequent := indexOf(models.PerformerSortEnumSharedSceneCount, frequent.ID)
+	sharedOccasional := indexOf(models.PerformerSortEnumSharedSceneCount, occasional.ID)
+	assert.NotEqual(s.t, -1, sharedFrequent, "Partner missing from SHARED_SCENE_COUNT results")
+	assert.NotEqual(s.t, -1, sharedOccasional, "Partner missing from SHARED_SCENE_COUNT results")
+	assert.Less(s.t, sharedFrequent, sharedOccasional, "Partner with more shared scenes should sort first")
+
+	totalFrequent := indexOf(models.PerformerSortEnumSceneCount, frequent.ID)
+	totalOccasional := indexOf(models.PerformerSortEnumSceneCount, occasional.ID)
+	assert.Less(s.t, totalOccasional, totalFrequent, "SCENE_COUNT should still rank by total scenes")
+}
+
+func TestQueryPerformersSharedSceneCountSort(t *testing.T) {
+	pt := createPerformerTestRunner(t)
+	pt.testQueryPerformersSharedSceneCountSort()
+}
+
+// testQueryPerformersByName covers the ILIKE name filters. Distinctive names
+// isolate the assertions from other tests sharing the database.
+func (s *performerTestRunner) testQueryPerformersByName() {
+	disambiguation := "Norwegian illustrator"
+	target, err := s.createTestPerformer(&models.PerformerCreateInput{
+		Name:           "Solveig Vandenberg",
+		Disambiguation: &disambiguation,
+	})
+	assert.NoError(s.t, err)
+
+	other, err := s.createTestPerformer(&models.PerformerCreateInput{
+		Name: "Marguerite Castellani",
+	})
+	assert.NoError(s.t, err)
+
+	contains := func(result *queryPerformersResultType, id string) bool {
+		for _, p := range result.Performers {
+			if p.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+	query := func(input models.PerformerQueryInput) *queryPerformersResultType {
+		input.Page = 1
+		input.PerPage = 25
+		input.Sort = models.PerformerSortEnumName
+		input.Direction = models.SortDirectionEnumAsc
+		result, err := s.client.queryPerformers(input)
+		assert.NoError(s.t, err)
+		return result
+	}
+
+	// Case-insensitive substring, not a prefix match
+	name := "OLVEIG VANDEN"
+	result := query(models.PerformerQueryInput{Name: &name})
+	assert.True(s.t, contains(result, target.ID), "Name should match case-insensitively mid-string")
+	assert.False(s.t, contains(result, other.ID))
+
+	// Names also searches disambiguation
+	names := "orwegian illustrat"
+	result = query(models.PerformerQueryInput{Names: &names})
+	assert.True(s.t, contains(result, target.ID), "Names should match on disambiguation")
+	assert.False(s.t, contains(result, other.ID))
+
+	// Under three characters there is no whole trigram to look up, so the
+	// planner cannot use the index. Results must be unaffected.
+	short := "ei"
+	result = query(models.PerformerQueryInput{Name: &short})
+	assert.True(s.t, contains(result, target.ID), "Short substrings should still match")
+
+	nomatch := "Zbigniew Kowalczyk"
+	result = query(models.PerformerQueryInput{Name: &nomatch})
+	assert.False(s.t, contains(result, target.ID))
+	assert.False(s.t, contains(result, other.ID))
+}
+
+func TestQueryPerformersByName(t *testing.T) {
+	pt := createPerformerTestRunner(t)
+	pt.testQueryPerformersByName()
 }

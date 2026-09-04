@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/gofrs/uuid"
 	"github.com/jackc/pgx/v5"
@@ -34,6 +35,16 @@ func NewScene(queries *queries.Queries, withTxn queries.WithTxnFunc) *Scene {
 // WithTxn executes a function within a transaction
 func (s *Scene) WithTxn(fn func(*queries.Queries) error) error {
 	return s.withTxn(fn)
+}
+
+func (s *Scene) RefreshPopularityAllTime(ctx context.Context) error {
+	_, err := s.queries.DB().Exec(ctx, "REFRESH MATERIALIZED VIEW CONCURRENTLY scene_popularity_all_time")
+	return err
+}
+
+func (s *Scene) RefreshPopularityTrending(ctx context.Context) error {
+	_, err := s.queries.DB().Exec(ctx, "REFRESH MATERIALIZED VIEW CONCURRENTLY scene_popularity_trending")
+	return err
 }
 
 // Queries
@@ -72,11 +83,21 @@ func (s *Scene) FindScenesBySceneFingerprints(ctx context.Context, sceneFingerpr
 		}
 	}
 
-	rows, err := s.queries.FindScenesByFullFingerprintsWithHash(ctx, queries.FindScenesByFullFingerprintsWithHashParams{
-		Phashes:  phashes,
-		Hashes:   hashes,
-		Distance: distance,
-	})
+	var rows []queries.FindScenesByFullFingerprintsWithHashRow
+	var err error
+	if distance > 0 {
+		rows, err = s.queries.FindScenesByFullFingerprintsWithHash(ctx, queries.FindScenesByFullFingerprintsWithHashParams{
+			Phashes:  phashes,
+			Hashes:   hashes,
+			Distance: distance,
+		})
+	} else {
+		var exactRows []queries.FindScenesByFingerprintsExactWithHashRow
+		exactRows, err = s.queries.FindScenesByFingerprintsExactWithHash(ctx, hashes)
+		for _, r := range exactRows {
+			rows = append(rows, queries.FindScenesByFullFingerprintsWithHashRow(r))
+		}
+	}
 	if err != nil || len(rows) == 0 {
 		return make([][]*models.Scene, len(sceneFingerprints)), err
 	}
@@ -113,8 +134,16 @@ func (s *Scene) FindScenesBySceneFingerprints(ctx context.Context, sceneFingerpr
 }
 
 func (s *Scene) SearchScenesWithCount(ctx context.Context, term string, limit int, offset int) (*models.SceneQuery, error) {
+	// Tokenize on whitespace; each token is scored independently by SearchScenes.
+	tokens := strings.Fields(term)
+	if len(tokens) == 0 {
+		return &models.SceneQuery{
+			SearchResults: &models.SceneSearchResults{Scenes: []models.Scene{}, Count: 0},
+		}, nil
+	}
+
 	rows, err := s.queries.SearchScenes(ctx, queries.SearchScenesParams{
-		Term:   &term,
+		Tokens: tokens,
 		Limit:  int32(limit),
 		Offset: int32(offset),
 	})
@@ -173,6 +202,26 @@ func (s *Scene) CountByPerformer(ctx context.Context, performerID uuid.UUID) (in
 		return 0, fmt.Errorf("failed to count scenes by performer: %w", err)
 	}
 	return int(count), nil
+}
+
+func (s *Scene) LoadCountsByPerformerIds(ctx context.Context, ids []uuid.UUID) ([]int, []error) {
+	counts, err := s.queries.CountScenesByPerformerIds(ctx, ids)
+	if err != nil {
+		return nil, errutil.DuplicateError(err, len(ids))
+	}
+
+	countMap := make(map[uuid.UUID]int, len(counts))
+	for _, count := range counts {
+		countMap[count.PerformerID] = int(count.SceneCount)
+	}
+
+	// Performers with no scenes are absent from the result set and default to zero
+	result := make([]int, len(ids))
+	for i, id := range ids {
+		result[i] = countMap[id]
+	}
+
+	return result, nil
 }
 
 func (s *Scene) GetPerformers(ctx context.Context, sceneID uuid.UUID) ([]models.PerformerAppearance, error) {
@@ -644,8 +693,10 @@ func (s *Scene) SubmitFingerprints(ctx context.Context, inputs []models.Fingerpr
 	return results, nil
 }
 
-func (s *Scene) MoveFingerprintSubmissions(ctx context.Context, input models.MoveFingerprintSubmissionsInput) error {
-	return s.withTxn(func(txnQueries *queries.Queries) error {
+// MoveFingerprintSubmissions returns the users whose submissions were moved, keyed by fingerprint hash.
+func (s *Scene) MoveFingerprintSubmissions(ctx context.Context, input models.MoveFingerprintSubmissionsInput) (map[models.FingerprintHash][]uuid.UUID, error) {
+	movedUsers := make(map[models.FingerprintHash][]uuid.UUID)
+	err := s.withTxn(func(txnQueries *queries.Queries) error {
 		// Validate source scene exists and is not deleted
 		sourceScene, err := txnQueries.FindScene(ctx, input.SourceSceneID)
 		if err != nil {
@@ -666,7 +717,18 @@ func (s *Scene) MoveFingerprintSubmissions(ctx context.Context, input models.Mov
 
 		// Move each fingerprint
 		for _, fp := range input.Fingerprints {
-			rowsAffected, err := txnQueries.MoveSceneFingerprintSubmissions(ctx, queries.MoveSceneFingerprintSubmissionsParams{
+			// Drop reports and any source rows that would collide with an existing target submission.
+			pruned, err := txnQueries.PruneSceneFingerprintsForMove(ctx, queries.PruneSceneFingerprintsForMoveParams{
+				Hash:          fp.Hash.Int64(),
+				Algorithm:     fp.Algorithm.String(),
+				SourceSceneID: input.SourceSceneID,
+				TargetSceneID: input.TargetSceneID,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to prune fingerprint %s (%s): %w", fp.Hash.Hex(), fp.Algorithm, err)
+			}
+
+			moved, err := txnQueries.MoveSceneFingerprintSubmissions(ctx, queries.MoveSceneFingerprintSubmissionsParams{
 				Hash:          fp.Hash.Int64(),
 				Algorithm:     fp.Algorithm.String(),
 				TargetSceneID: input.TargetSceneID,
@@ -675,13 +737,27 @@ func (s *Scene) MoveFingerprintSubmissions(ctx context.Context, input models.Mov
 			if err != nil {
 				return fmt.Errorf("failed to move fingerprint %s (%s): %w", fp.Hash.Hex(), fp.Algorithm, err)
 			}
-			if rowsAffected == 0 {
+			if len(pruned)+len(moved) == 0 {
 				return fmt.Errorf("fingerprint %s (%s) not found on source scene", fp.Hash.Hex(), fp.Algorithm)
 			}
+
+			// Pruned submissions were merged into an existing target submission; pruned reports are just dropped.
+			userIDs := moved
+			for _, row := range pruned {
+				if row.Vote == 1 {
+					userIDs = append(userIDs, row.UserID)
+				}
+			}
+			movedUsers[fp.Hash] = userIDs
 		}
 
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	return movedUsers, nil
 }
 
 func (s *Scene) DeleteFingerprintSubmissions(ctx context.Context, input models.DeleteFingerprintSubmissionsInput) error {

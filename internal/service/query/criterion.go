@@ -15,15 +15,23 @@ import (
 // fkColumn: the foreign key column in the join table referencing the main table (e.g., "scene_id")
 // joinField: the field in the join table to filter on (e.g., "performer_id")
 func ApplyMultiIDCriterion(query *sq.SelectBuilder, tableName, joinTable, fkColumn, joinField string, criterion *models.MultiIDCriterionInput) error {
-	switch criterion.Modifier {
+	// For a single value, "includes all" is identical to "includes" — collapse
+	// here so the Includes branch handles both.
+	mod := criterion.Modifier
+	if mod == models.CriterionModifierIncludesAll && len(criterion.Value) == 1 {
+		mod = models.CriterionModifierIncludes
+	}
+
+	switch mod {
 	case models.CriterionModifierIncludes:
-		// includes any of the provided ids
-		subquery := sq.Select(fmt.Sprintf("DISTINCT %s", fkColumn)).
+		// Semi-join — naturally deduplicating regardless of len, no DISTINCT needed.
+		subquery := sq.Select("1").
 			From(joinTable).
-			Where(sq.Eq{joinField: criterion.Value})
-		*query = query.JoinClause(sq.Expr(fmt.Sprintf("INNER JOIN (?) AS %s_filter ON %s.id = %s_filter.%s", joinTable, tableName, joinTable, fkColumn), subquery))
+			Where(sq.Eq{joinField: criterion.Value}).
+			Where(sq.Expr(fmt.Sprintf("%s.%s = %s.id", joinTable, fkColumn, tableName)))
+		*query = query.Where(sq.Expr("EXISTS (?)", subquery))
 	case models.CriterionModifierIncludesAll:
-		// includes all of the provided ids
+		// len > 1 only; "match all of these" has no semi-join equivalent.
 		subquery := sq.Select(fkColumn).
 			From(joinTable).
 			Where(sq.Eq{joinField: criterion.Value}).
@@ -31,15 +39,42 @@ func ApplyMultiIDCriterion(query *sq.SelectBuilder, tableName, joinTable, fkColu
 			Having(sq.Eq{"COUNT(*)": len(criterion.Value)})
 		*query = query.JoinClause(sq.Expr(fmt.Sprintf("INNER JOIN (?) AS %s_filter ON %s.id = %s_filter.%s", joinTable, tableName, joinTable, fkColumn), subquery))
 	case models.CriterionModifierExcludes:
-		// excludes all of the provided ids
-		subquery := sq.Select(fkColumn).
+		subquery := sq.Select("1").
 			From(joinTable).
-			Where(sq.Eq{joinField: criterion.Value})
-		*query = query.Where(sq.Expr(fmt.Sprintf("%s.id NOT IN (?)", tableName), subquery))
+			Where(sq.Eq{joinField: criterion.Value}).
+			Where(sq.Expr(fmt.Sprintf("%s.%s = %s.id", joinTable, fkColumn, tableName)))
+		*query = query.Where(sq.Expr("NOT EXISTS (?)", subquery))
 	default:
 		return fmt.Errorf("unsupported modifier %s for %s.%s", criterion.Modifier, joinTable, joinField)
 	}
 	return nil
+}
+
+// ApplyIDCriterion applies ID criterion for a direct column (equals, not equals, includes, excludes, is null, not null)
+// Returns the modified query
+func ApplyIDCriterion(query sq.SelectBuilder, field string, criterion *models.IDCriterionInput) sq.SelectBuilder {
+	switch criterion.Modifier {
+	case models.CriterionModifierEquals:
+		if len(criterion.Value) > 0 {
+			return query.Where(sq.Eq{field: criterion.Value[0]})
+		}
+		return query
+	case models.CriterionModifierNotEquals:
+		if len(criterion.Value) > 0 {
+			return query.Where(sq.NotEq{field: criterion.Value[0]})
+		}
+		return query
+	case models.CriterionModifierIncludes:
+		return query.Where(sq.Eq{field: criterion.Value})
+	case models.CriterionModifierExcludes:
+		return query.Where(sq.Or{sq.Expr(field + " IS NULL"), sq.NotEq{field: criterion.Value}})
+	case models.CriterionModifierIsNull:
+		return query.Where(field + " IS NULL")
+	case models.CriterionModifierNotNull:
+		return query.Where(field + " IS NOT NULL")
+	default:
+		return query
+	}
 }
 
 // ApplyIntCriterion applies integer criterion (equals, not equals, greater than, less than, is null, not null)
@@ -63,7 +98,7 @@ func ApplyIntCriterion(query sq.SelectBuilder, field string, criterion *models.I
 	}
 }
 
-// ApplyStringCriterion applies string criterion (equals, not equals, is null, not null)
+// ApplyStringCriterion applies string criterion (equals, not equals, includes, is null, not null)
 // Returns the modified query
 func ApplyStringCriterion(query sq.SelectBuilder, field string, criterion *models.StringCriterionInput) sq.SelectBuilder {
 	switch criterion.Modifier {
@@ -71,6 +106,8 @@ func ApplyStringCriterion(query sq.SelectBuilder, field string, criterion *model
 		return query.Where(sq.Eq{field: criterion.Value})
 	case models.CriterionModifierNotEquals:
 		return query.Where(sq.NotEq{field: criterion.Value})
+	case models.CriterionModifierIncludes:
+		return query.Where(sq.ILike{field: "%" + criterion.Value + "%"})
 	case models.CriterionModifierIsNull:
 		return query.Where(field + " IS NULL")
 	case models.CriterionModifierNotNull:

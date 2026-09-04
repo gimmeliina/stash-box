@@ -43,7 +43,7 @@ func (s *notificationTestRunner) testNotificationOnCommentOwnEdit() {
 	commenterUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumEdit})
 	assert.NoError(s.t, err)
 
-	commenterCtx := context.WithValue(s.ctx, auth.ContextUser, commenterUser)
+	commenterCtx := context.WithValue(s.ctx, auth.ContextUser, auth.FromUser(commenterUser))
 	commentText := "Test comment on edit"
 	_, err = s.resolver.Mutation().EditComment(commenterCtx, models.EditCommentInput{
 		ID:      createdEdit.ID,
@@ -57,7 +57,8 @@ func (s *notificationTestRunner) testNotificationOnCommentOwnEdit() {
 	// Verify unread count increased
 	newUnreadCount, err := s.client.getUnreadNotificationCount()
 	assert.NoError(s.t, err)
-	assert.True(s.t, newUnreadCount > initialUnreadCount, "Unread count should have increased after comment")
+	assert.True(s.t, newUnreadCount.Total > initialUnreadCount.Total, "Unread count should have increased after comment")
+	assert.True(s.t, newUnreadCount.Urgent > initialUnreadCount.Urgent, "Urgent count should have increased after comment on own edit")
 
 	// Query notifications to verify the notification was created
 	result, err := s.client.queryNotifications(models.QueryNotificationsInput{
@@ -100,7 +101,7 @@ func (s *notificationTestRunner) testNotificationOnDownvoteOwnEdit() {
 	voterUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumVote})
 	assert.NoError(s.t, err)
 
-	voterCtx := context.WithValue(s.ctx, auth.ContextUser, voterUser)
+	voterCtx := context.WithValue(s.ctx, auth.ContextUser, auth.FromUser(voterUser))
 	_, err = s.resolver.Mutation().EditVote(voterCtx, models.EditVoteInput{
 		ID:   createdEdit.ID,
 		Vote: models.VoteTypeEnumReject,
@@ -113,7 +114,8 @@ func (s *notificationTestRunner) testNotificationOnDownvoteOwnEdit() {
 	// Verify unread count increased
 	newUnreadCount, err := s.client.getUnreadNotificationCount()
 	assert.NoError(s.t, err)
-	assert.True(s.t, newUnreadCount > initialUnreadCount, "Unread count should have increased after downvote")
+	assert.True(s.t, newUnreadCount.Total > initialUnreadCount.Total, "Unread count should have increased after downvote")
+	assert.True(s.t, newUnreadCount.Urgent > initialUnreadCount.Urgent, "Urgent count should have increased after downvote on own edit")
 
 	// Query notifications to verify
 	result, err := s.client.queryNotifications(models.QueryNotificationsInput{
@@ -154,7 +156,8 @@ func (s *notificationTestRunner) testNotificationOnFailedOwnEdit() {
 	// Verify unread count did NOT increase (no notification for self-cancellation)
 	newUnreadCount, err := s.client.getUnreadNotificationCount()
 	assert.NoError(s.t, err)
-	assert.Equal(s.t, initialUnreadCount, newUnreadCount, "Unread count should NOT change when user cancels their own edit")
+	assert.Equal(s.t, initialUnreadCount.Total, newUnreadCount.Total, "Unread count should NOT change when user cancels their own edit")
+	assert.Equal(s.t, initialUnreadCount.Urgent, newUnreadCount.Urgent, "Urgent count should NOT change when user cancels their own edit")
 }
 
 // testNotificationOnAdminCancelEdit tests that a notification IS created when an admin cancels/rejects the user's edit
@@ -175,7 +178,7 @@ func (s *notificationTestRunner) testNotificationOnAdminCancelEdit() {
 	assert.NoError(s.t, err)
 
 	// Use the existing admin user to cancel the edit
-	adminCtx := context.WithValue(s.ctx, auth.ContextUser, userDB.admin)
+	adminCtx := context.WithValue(s.ctx, auth.ContextUser, auth.FromUser(userDB.admin))
 	adminCtx = context.WithValue(adminCtx, auth.ContextRoles, userDB.adminRoles)
 	_, err = s.resolver.Mutation().CancelEdit(adminCtx, models.CancelEditInput{
 		ID: createdEdit.ID,
@@ -188,7 +191,8 @@ func (s *notificationTestRunner) testNotificationOnAdminCancelEdit() {
 	// Verify unread count increased
 	newUnreadCount, err := s.client.getUnreadNotificationCount()
 	assert.NoError(s.t, err)
-	assert.True(s.t, newUnreadCount > initialUnreadCount, "Unread count should have increased after admin cancellation")
+	assert.True(s.t, newUnreadCount.Total > initialUnreadCount.Total, "Unread count should have increased after admin cancellation")
+	assert.True(s.t, newUnreadCount.Urgent > initialUnreadCount.Urgent, "Urgent count should have increased after admin cancellation of own edit")
 
 	// Query notifications to verify
 	result, err := s.client.queryNotifications(models.QueryNotificationsInput{
@@ -221,7 +225,7 @@ func (s *notificationTestRunner) testMarkSpecificNotificationRead() {
 	commenterUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumEdit})
 	assert.NoError(s.t, err)
 
-	commenterCtx := context.WithValue(s.ctx, auth.ContextUser, commenterUser)
+	commenterCtx := context.WithValue(s.ctx, auth.ContextUser, auth.FromUser(commenterUser))
 	editWithComment, err := s.resolver.Mutation().EditComment(commenterCtx, models.EditCommentInput{
 		ID:      createdEdit.ID,
 		Comment: "Test comment",
@@ -240,7 +244,7 @@ func (s *notificationTestRunner) testMarkSpecificNotificationRead() {
 	// Get unread count before marking as read
 	unreadCountBefore, err := s.client.getUnreadNotificationCount()
 	assert.NoError(s.t, err)
-	assert.True(s.t, unreadCountBefore >= 1, "Should have at least one unread notification")
+	assert.True(s.t, unreadCountBefore.Total >= 1, "Should have at least one unread notification")
 
 	// Mark the specific notification as read using the comment ID
 	success, err := s.client.markNotificationsRead(&models.MarkNotificationReadInput{
@@ -255,7 +259,7 @@ func (s *notificationTestRunner) testMarkSpecificNotificationRead() {
 	// Verify unread count decreased
 	unreadCountAfter, err := s.client.getUnreadNotificationCount()
 	assert.NoError(s.t, err)
-	assert.True(s.t, unreadCountAfter < unreadCountBefore, "Unread count should have decreased after marking notification as read")
+	assert.True(s.t, unreadCountAfter.Total < unreadCountBefore.Total, "Unread count should have decreased after marking notification as read")
 
 	// Query unread notifications and verify the count decreased
 	resultAfter, err := s.client.queryNotifications(models.QueryNotificationsInput{
@@ -264,7 +268,7 @@ func (s *notificationTestRunner) testMarkSpecificNotificationRead() {
 		UnreadOnly: pointerTo(true),
 	})
 	assert.NoError(s.t, err)
-	assert.True(s.t, len(resultAfter.Notifications) < unreadCountBefore, "Should have fewer unread notifications after marking one as read")
+	assert.True(s.t, len(resultAfter.Notifications) < unreadCountBefore.Total, "Should have fewer unread notifications after marking one as read")
 }
 
 // testMarkAllNotificationsRead tests marking all notifications as read
@@ -287,7 +291,7 @@ func (s *notificationTestRunner) testMarkAllNotificationsRead() {
 		commenterUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumEdit})
 		assert.NoError(s.t, err)
 
-		commenterCtx := context.WithValue(s.ctx, auth.ContextUser, commenterUser)
+		commenterCtx := context.WithValue(s.ctx, auth.ContextUser, auth.FromUser(commenterUser))
 		_, err = s.resolver.Mutation().EditComment(commenterCtx, models.EditCommentInput{
 			ID:      createdEdit.ID,
 			Comment: "Test comment",
@@ -301,7 +305,7 @@ func (s *notificationTestRunner) testMarkAllNotificationsRead() {
 	// Verify we have unread notifications
 	unreadCountBefore, err := s.client.getUnreadNotificationCount()
 	assert.NoError(s.t, err)
-	assert.True(s.t, unreadCountBefore >= 3, "Should have at least 3 unread notifications")
+	assert.True(s.t, unreadCountBefore.Total >= 3, "Should have at least 3 unread notifications")
 
 	// Mark all notifications as read by passing nil
 	success, err := s.client.markNotificationsRead(nil)
@@ -311,7 +315,8 @@ func (s *notificationTestRunner) testMarkAllNotificationsRead() {
 	// Verify unread count is now 0
 	unreadCountAfter, err := s.client.getUnreadNotificationCount()
 	assert.NoError(s.t, err)
-	assert.Equal(s.t, unreadCountAfter, 0, "Unread count should be 0 after marking all as read")
+	assert.Equal(s.t, 0, unreadCountAfter.Total, "Unread count should be 0 after marking all as read")
+	assert.Equal(s.t, 0, unreadCountAfter.Urgent, "Urgent count should be 0 after marking all as read")
 
 	// Query unread notifications and verify none are returned
 	result, err := s.client.queryNotifications(models.QueryNotificationsInput{
@@ -358,73 +363,87 @@ func TestMarkAllNotificationsRead(t *testing.T) {
 	pt.testMarkAllNotificationsRead()
 }
 
-// testNotificationSubscriptionRoleEnforcement tests that READ users can only subscribe to favorite notification types
+// General notification types are subscribable by everyone, regardless of role.
+var generalSubscriptions = []models.NotificationEnum{
+	models.NotificationEnumFavoritePerformerScene,
+	models.NotificationEnumFavoritePerformerEdit,
+	models.NotificationEnumFavoriteStudioScene,
+	models.NotificationEnumFavoriteStudioEdit,
+	models.NotificationEnumFingerprintedSceneEdit,
+}
+
+// Voting notification types require the VOTE role.
+var votingSubscriptions = []models.NotificationEnum{
+	models.NotificationEnumUpdatedEdit,
+	models.NotificationEnumCommentVotedEdit,
+}
+
+// Editing notification types require the EDIT role.
+var editingSubscriptions = []models.NotificationEnum{
+	models.NotificationEnumCommentOwnEdit,
+	models.NotificationEnumDownvoteOwnEdit,
+	models.NotificationEnumFailedOwnEdit,
+	models.NotificationEnumCommentCommentedEdit,
+}
+
+// testNotificationSubscriptionRoleEnforcement tests that subscription types are gated by role:
+// general types are open to everyone, voting types require VOTE, and editing types require EDIT.
 func (s *notificationTestRunner) testNotificationSubscriptionRoleEnforcement() {
-	// Test 1: READ user can subscribe to favorite notification types
+	// allSubscriptions is every subscribable type, submitted in each test case.
+	var allSubscriptions []models.NotificationEnum
+	allSubscriptions = append(allSubscriptions, generalSubscriptions...)
+	allSubscriptions = append(allSubscriptions, votingSubscriptions...)
+	allSubscriptions = append(allSubscriptions, editingSubscriptions...)
+
+	// Test 1: READ user can only subscribe to general types; voting and editing are filtered out.
 	readRunner := asRead(s.t)
-	favoriteSubscriptions := []models.NotificationEnum{
-		models.NotificationEnumFavoritePerformerScene,
-		models.NotificationEnumFavoritePerformerEdit,
-		models.NotificationEnumFavoriteStudioScene,
-		models.NotificationEnumFavoriteStudioEdit,
-	}
-
-	success, err := readRunner.client.updateNotificationSubscriptions(favoriteSubscriptions)
-	assert.NoError(s.t, err)
-	assert.True(s.t, success, "READ user should be able to subscribe to favorite notification types")
-
-	// Verify subscriptions were actually set
-	currentSubscriptions, err := readRunner.getUserNotificationSubscriptions()
-	assert.NoError(s.t, err)
-	assert.ElementsMatch(s.t, favoriteSubscriptions, currentSubscriptions, "READ user should have all favorite subscriptions set")
-
-	// Test 2: READ user attempts to subscribe to both favorite and non-favorite types
-	// Non-favorite types should be silently filtered out
-	mixedSubscriptions := []models.NotificationEnum{
-		models.NotificationEnumFavoritePerformerScene, // favorite - should be kept
-		models.NotificationEnumFavoriteStudioEdit,     // favorite - should be kept
-		models.NotificationEnumCommentOwnEdit,         // non-favorite - should be filtered
-		models.NotificationEnumDownvoteOwnEdit,        // non-favorite - should be filtered
-		models.NotificationEnumUpdatedEdit,            // non-favorite - should be filtered
-		models.NotificationEnumCommentCommentedEdit,   // non-favorite - should be filtered
-		models.NotificationEnumFingerprintedSceneEdit, // non-favorite - should be filtered
-	}
-
-	success, err = readRunner.client.updateNotificationSubscriptions(mixedSubscriptions)
+	success, err := readRunner.client.updateNotificationSubscriptions(allSubscriptions)
 	assert.NoError(s.t, err)
 	assert.True(s.t, success, "updateNotificationSubscriptions should succeed for READ user")
 
-	// Verify only favorite subscriptions were set
-	currentSubscriptions, err = readRunner.getUserNotificationSubscriptions()
+	currentSubscriptions, err := readRunner.getUserNotificationSubscriptions()
 	assert.NoError(s.t, err)
-	expectedSubscriptions := []models.NotificationEnum{
-		models.NotificationEnumFavoritePerformerScene,
-		models.NotificationEnumFavoriteStudioEdit,
-	}
-	assert.ElementsMatch(s.t, expectedSubscriptions, currentSubscriptions, "READ user should only have favorite subscriptions set")
+	assert.ElementsMatch(s.t, generalSubscriptions, currentSubscriptions, "READ user should only have general subscriptions set")
 
-	// Test 3: EDIT user can subscribe to all notification types including non-favorites
+	// Test 2: VOTE user can subscribe to general and voting types, but editing is filtered out.
+	voteUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumVote})
+	assert.NoError(s.t, err)
+	voteRunner := createTestRunner(s.t, voteUser, []models.RoleEnum{models.RoleEnumVote})
+
+	success, err = voteRunner.client.updateNotificationSubscriptions(allSubscriptions)
+	assert.NoError(s.t, err)
+	assert.True(s.t, success, "updateNotificationSubscriptions should succeed for VOTE user")
+
+	currentSubscriptions, err = voteRunner.getUserNotificationSubscriptions()
+	assert.NoError(s.t, err)
+	expectedSubscriptions := append(append([]models.NotificationEnum{}, generalSubscriptions...), votingSubscriptions...)
+	assert.ElementsMatch(s.t, expectedSubscriptions, currentSubscriptions, "VOTE user should have general and voting subscriptions set")
+
+	// Test 3: EDIT user can subscribe to general and editing types. The roles are
+	// independent, so an edit-only user without VOTE has voting types filtered out.
 	editRunner := asEdit(s.t)
-	allSubscriptions := []models.NotificationEnum{
-		models.NotificationEnumFavoritePerformerScene,
-		models.NotificationEnumFavoriteStudioEdit,
-		models.NotificationEnumCommentOwnEdit,
-		models.NotificationEnumDownvoteOwnEdit,
-		models.NotificationEnumUpdatedEdit,
-		models.NotificationEnumFailedOwnEdit,
-		models.NotificationEnumCommentCommentedEdit,
-		models.NotificationEnumCommentVotedEdit,
-		models.NotificationEnumFingerprintedSceneEdit,
-	}
-
 	success, err = editRunner.client.updateNotificationSubscriptions(allSubscriptions)
 	assert.NoError(s.t, err)
-	assert.True(s.t, success, "EDIT user should be able to subscribe to all notification types")
+	assert.True(s.t, success, "updateNotificationSubscriptions should succeed for EDIT user")
 
-	// Verify all subscriptions were set
 	currentSubscriptions, err = editRunner.getUserNotificationSubscriptions()
 	assert.NoError(s.t, err)
-	assert.ElementsMatch(s.t, allSubscriptions, currentSubscriptions, "EDIT user should have all subscriptions set")
+	expectedSubscriptions = append(append([]models.NotificationEnum{}, generalSubscriptions...), editingSubscriptions...)
+	assert.ElementsMatch(s.t, expectedSubscriptions, currentSubscriptions, "EDIT user should have general and editing subscriptions set")
+
+	// Test 4: A user with both VOTE and EDIT roles can subscribe to every type.
+	bothRoles := []models.RoleEnum{models.RoleEnumVote, models.RoleEnumEdit}
+	bothUser, err := s.createTestUser(nil, bothRoles)
+	assert.NoError(s.t, err)
+	bothRunner := createTestRunner(s.t, bothUser, bothRoles)
+
+	success, err = bothRunner.client.updateNotificationSubscriptions(allSubscriptions)
+	assert.NoError(s.t, err)
+	assert.True(s.t, success, "VOTE+EDIT user should be able to subscribe to all notification types")
+
+	currentSubscriptions, err = bothRunner.getUserNotificationSubscriptions()
+	assert.NoError(s.t, err)
+	assert.ElementsMatch(s.t, allSubscriptions, currentSubscriptions, "VOTE+EDIT user should have all subscriptions set")
 }
 
 func TestNotificationSubscriptionRoleEnforcement(t *testing.T) {
@@ -453,7 +472,7 @@ func (s *notificationTestRunner) testQueryNotificationsPagination() {
 		commenterUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumEdit})
 		assert.NoError(s.t, err)
 
-		commenterCtx := context.WithValue(s.ctx, auth.ContextUser, commenterUser)
+		commenterCtx := context.WithValue(s.ctx, auth.ContextUser, auth.FromUser(commenterUser))
 		_, err = s.resolver.Mutation().EditComment(commenterCtx, models.EditCommentInput{
 			ID:      createdEdit.ID,
 			Comment: "Test comment",
@@ -545,7 +564,7 @@ func (s *notificationTestRunner) testQueryNotificationsTypeFilter() {
 	commenterUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumEdit})
 	assert.NoError(s.t, err)
 
-	commenterCtx := context.WithValue(s.ctx, auth.ContextUser, commenterUser)
+	commenterCtx := context.WithValue(s.ctx, auth.ContextUser, auth.FromUser(commenterUser))
 	_, err = s.resolver.Mutation().EditComment(commenterCtx, models.EditCommentInput{
 		ID:      createdEdit.ID,
 		Comment: "Test comment",
@@ -556,7 +575,7 @@ func (s *notificationTestRunner) testQueryNotificationsTypeFilter() {
 	voterUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumVote})
 	assert.NoError(s.t, err)
 
-	voterCtx := context.WithValue(s.ctx, auth.ContextUser, voterUser)
+	voterCtx := context.WithValue(s.ctx, auth.ContextUser, auth.FromUser(voterUser))
 	_, err = s.resolver.Mutation().EditVote(voterCtx, models.EditVoteInput{
 		ID:   createdEdit.ID,
 		Vote: models.VoteTypeEnumReject,
@@ -608,4 +627,80 @@ func (s *notificationTestRunner) testQueryNotificationsTypeFilter() {
 func TestQueryNotificationsTypeFilter(t *testing.T) {
 	pt := createNotificationTestRunner(t)
 	pt.testQueryNotificationsTypeFilter()
+}
+
+// testNotificationOnFavoriteStudioScene tests that a FAVORITE_STUDIO_SCENE notification is created
+// when a scene is created for a studio that the user has favorited and the edit is approved via voting
+func (s *notificationTestRunner) testNotificationOnFavoriteStudioScene() {
+	// Create a studio using the admin user
+	adminRunner := asAdmin(s.t)
+	studio, err := adminRunner.createTestStudio(nil)
+	assert.NoError(s.t, err)
+
+	studioID := studio.UUID()
+
+	// Create a subscriber user who will favorite the studio
+	subscriberUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumEdit})
+	assert.NoError(s.t, err)
+
+	// Create a runner for the subscriber to make GraphQL calls
+	subscriberRunner := createTestRunner(s.t, subscriberUser, []models.RoleEnum{models.RoleEnumEdit})
+
+	// Subscriber favorites the studio
+	_, err = subscriberRunner.client.favoriteStudio(studioID, true)
+	assert.NoError(s.t, err)
+
+	// Subscriber subscribes to FAVORITE_STUDIO_SCENE notifications
+	subscriptions := []models.NotificationEnum{
+		models.NotificationEnumFavoriteStudioScene,
+	}
+	_, err = subscriberRunner.client.updateNotificationSubscriptions(subscriptions)
+	assert.NoError(s.t, err)
+
+	// Create an editor user who will submit the scene edit
+	editorUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumEdit})
+	assert.NoError(s.t, err)
+
+	editorRunner := createTestRunner(s.t, editorUser, []models.RoleEnum{models.RoleEnumEdit})
+
+	// Editor creates a scene edit with the favorited studio
+	title := editorRunner.generateSceneName()
+	sceneEditDetailsInput := models.SceneEditDetailsInput{
+		Title:    &title,
+		StudioID: &studioID,
+	}
+	createdEdit, err := editorRunner.createTestSceneEdit(models.OperationEnumCreate, &sceneEditDetailsInput, nil)
+	assert.NoError(s.t, err)
+
+	// Have 3 voters vote to approve the edit (reaching the threshold)
+	for i := 1; i <= 3; i++ {
+		voterUser, err := s.createTestUser(nil, []models.RoleEnum{models.RoleEnumVote})
+		assert.NoError(s.t, err)
+
+		voterCtx := context.WithValue(s.ctx, auth.ContextUser, auth.FromUser(voterUser))
+		_, err = s.resolver.Mutation().EditVote(voterCtx, models.EditVoteInput{
+			ID:   createdEdit.ID,
+			Vote: models.VoteTypeEnumAccept,
+		})
+		assert.NoError(s.t, err)
+	}
+
+	// Small delay to ensure notification is created (notifications are triggered asynchronously)
+	time.Sleep(200 * time.Millisecond)
+
+	// Query notifications and verify the notification type
+	notificationType := models.NotificationEnumFavoriteStudioScene
+	result, err := subscriberRunner.client.queryNotifications(models.QueryNotificationsInput{
+		Page:       1,
+		PerPage:    25,
+		Type:       &notificationType,
+		UnreadOnly: pointerTo(true),
+	})
+	assert.NoError(s.t, err)
+	assert.Equal(s.t, 1, len(result.Notifications), "Subscriber should have exactly one FAVORITE_STUDIO_SCENE notification")
+}
+
+func TestNotificationOnFavoriteStudioScene(t *testing.T) {
+	pt := createNotificationTestRunner(t)
+	pt.testNotificationOnFavoriteStudioScene()
 }

@@ -2,8 +2,22 @@
   background-color: $textfield-bg;
   margin-top: 1rem;
 
+  // Hidden comments are only visible to moderators and the author
+  &-hidden {
+    opacity: 0.6;
+    border-style: dashed;
+  }
+
   .card-body a {
     color: $link-color;
+  }
+
+  blockquote {
+    border-left: 3px solid $muted-gray;
+    padding-left: 1rem;
+    margin-left: 0;
+    font-style: italic;
+    color: $muted-gray;
   }
 }
 

@@ -35,6 +35,18 @@ type ImageResizeConfig struct {
 	MinSize   int    `mapstructure:"min_size"`
 }
 
+type AutocertConfig struct {
+	Enabled  bool   `mapstructure:"enabled"`
+	Domain   string `mapstructure:"domain"`
+	Email    string `mapstructure:"email"`
+	CacheDir string `mapstructure:"cache_dir"`
+}
+
+type FrontendConfig struct {
+	Path   string `mapstructure:"path"`   // directory holding the build (index.html + assets/)
+	Prefix string `mapstructure:"prefix"` // URL mount point, e.g. "/v2"
+}
+
 type config struct {
 	Host         string `mapstructure:"host"`
 	Port         int    `mapstructure:"port"`
@@ -76,12 +88,13 @@ type config struct {
 	RequireTagRole bool `mapstructure:"require_tag_role"`
 
 	// Email settings
-	EmailHost string `mapstructure:"email_host"`
-	EmailPort int    `mapstructure:"email_port"`
-	EmailUser string `mapstructure:"email_user"`
-	EmailPW   string `mapstructure:"email_password"`
-	EmailFrom string `mapstructure:"email_from"`
-	HostURL   string `mapstructure:"host_url"`
+	EmailHost    string `mapstructure:"email_host"`
+	EmailPort    int    `mapstructure:"email_port"`
+	EmailUser    string `mapstructure:"email_user"`
+	EmailPW      string `mapstructure:"email_password"`
+	EmailFrom    string `mapstructure:"email_from"`
+	EmailTLSMode string `mapstructure:"email_tls_mode"`
+	HostURL      string `mapstructure:"host_url"`
 
 	// Image storage settings
 	ImageLocation    string `mapstructure:"image_location"`
@@ -113,11 +126,22 @@ type config struct {
 		ImageResizeConfig `mapstructure:",squash"`
 	}
 
+	Autocert struct {
+		AutocertConfig `mapstructure:",squash"`
+	}
+
 	PHashDistance int `mapstructure:"phash_distance"`
 
 	Title string `mapstructure:"title"`
 
+	// Additional on-disk frontend builds mounted at their own prefixes,
+	// served alongside the embedded UI at /.
+	Frontends []FrontendConfig `mapstructure:"frontends"`
+
 	DraftTimeLimit int `mapstructure:"draft_time_limit"`
+
+	// Number of days to retain mod audit logs (0 to disable logging)
+	ModAuditRetentionDays int `mapstructure:"mod_audit_retention_days"`
 
 	CSP string `mapstructure:"csp"`
 }
@@ -151,6 +175,7 @@ var C = &config{
 	EditUpdateLimit:            1,
 	RequireSceneDraft:          false,
 	RequireTagRole:             false,
+	ModAuditRetentionDays:      30,
 }
 
 func GetDatabasePath() string {
@@ -240,6 +265,18 @@ func GetEmailFrom() string {
 	return C.EmailFrom
 }
 
+// GetEmailTLSMode returns the configured STARTTLS policy for the SMTP client.
+// Recognized values: "mandatory" (default), "opportunistic", "none". Anything
+// else falls back to "mandatory" to preserve secure-by-default behavior.
+func GetEmailTLSMode() string {
+	switch C.EmailTLSMode {
+	case "opportunistic", "none":
+		return C.EmailTLSMode
+	default:
+		return "mandatory"
+	}
+}
+
 func GetHostURL() string {
 	return C.HostURL
 }
@@ -271,6 +308,32 @@ func GetOTelConfig() *OTelConfig {
 		return &C.OTel.OTelConfig
 	}
 	return nil
+}
+
+func GetAutocertConfig() *AutocertConfig {
+	if C.Autocert.Enabled {
+		return &C.Autocert.AutocertConfig
+	}
+	return nil
+}
+
+func GetMissingAutocertSettings() []string {
+	if !C.Autocert.Enabled {
+		return nil
+	}
+
+	missing := []string{}
+	if C.Autocert.Domain == "" {
+		missing = append(missing, "domain")
+	}
+	if C.Autocert.Email == "" {
+		missing = append(missing, "email")
+	}
+	if C.Autocert.CacheDir == "" {
+		missing = append(missing, "cache_dir")
+	}
+
+	return missing
 }
 
 // ValidateImageLocation returns an error is image_location is not set.
@@ -427,6 +490,10 @@ func GetTitle() string {
 	return C.Title
 }
 
+func GetFrontends() []FrontendConfig {
+	return C.Frontends
+}
+
 func GetFaviconPath() (*string, error) {
 	if len(C.FaviconPath) == 0 {
 		return nil, errors.New("favicon_path not set")
@@ -436,6 +503,10 @@ func GetFaviconPath() (*string, error) {
 
 func GetDraftTimeLimit() int {
 	return C.DraftTimeLimit
+}
+
+func GetModAuditRetentionDays() int {
+	return C.ModAuditRetentionDays
 }
 
 func GetMaxOpenConns() int {

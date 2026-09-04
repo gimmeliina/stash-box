@@ -1,15 +1,16 @@
 // biome-ignore-all lint/correctness/noNestedComponentDefinitions: Necessary for react-select
-import { type FC, useState } from "react";
-import Select, { type OnChangeValue } from "react-select";
-import { Form } from "react-bootstrap";
+
 import { uniq } from "lodash-es";
+import type { FC } from "react";
+import { Form } from "react-bootstrap";
+import Select, { type OnChangeValue } from "react-select";
 
 interface MultiSelectProps {
   values: IOptionType[];
   onChange: (values: string[]) => void;
   placeholder?: string;
   plural?: string;
-  initialSelected?: string[];
+  selected?: string[];
 }
 
 interface IOptionType {
@@ -23,17 +24,10 @@ const CheckboxSelect: FC<MultiSelectProps> = ({
   onChange,
   placeholder = "Select...",
   plural = "values",
-  initialSelected = [],
+  selected = [],
 }) => {
-  const [unselected, setUnselected] = useState<string[]>(initialSelected);
-
   const handleChange = (vals: OnChangeValue<IOptionType, true>) => {
-    const selected = uniq(
-      vals.flatMap((v) => [v.value, ...(v.subValues ?? [])]),
-    );
-
-    setUnselected(selected);
-    onChange(selected);
+    onChange(uniq(vals.flatMap((v) => [v.value, ...(v.subValues ?? [])])));
   };
 
   const formatLabel = (
@@ -45,7 +39,7 @@ const CheckboxSelect: FC<MultiSelectProps> = ({
         <div className="d-flex ms-3">
           <Form.Check
             className="me-2"
-            checked={unselected.includes(option.value)}
+            checked={selected.includes(option.value)}
           />
           {option.label}
         </div>
@@ -53,23 +47,21 @@ const CheckboxSelect: FC<MultiSelectProps> = ({
         <div className="d-flex">
           <Form.Check
             className="me-2"
-            checked={unselected.includes(option.value)}
+            checked={selected.includes(option.value)}
           />
           <span className="text-muted">{option.label}</span>
         </div>
       );
     return `${
-      unselected.length === 0 ? "All" : unselected.length
+      selected.length === 0 ? "All" : selected.length
     } ${plural} selected`;
   };
 
-  const defaultValue = values.filter((val) =>
-    initialSelected.includes(val.value),
-  );
+  const selectedOptions = values.filter((val) => selected.includes(val.value));
 
   return (
     <Select
-      defaultValue={defaultValue}
+      value={selectedOptions}
       isMulti
       classNamePrefix="react-select"
       className="react-select CheckboxSelect"
@@ -90,9 +82,9 @@ const CheckboxSelect: FC<MultiSelectProps> = ({
         DropdownIndicator: () => null,
         IndicatorSeparator: () => null,
         MultiValue: (e) =>
-          e.data.value === unselected[0] ? (
+          e.data.value === selected[0] ? (
             <span className="text-secondary">
-              {unselected.length} {plural} selected
+              {selected.length} {plural} selected
             </span>
           ) : null,
       }}

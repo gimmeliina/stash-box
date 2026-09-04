@@ -2,8 +2,10 @@ package edit
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/gofrs/uuid"
@@ -20,10 +22,16 @@ import (
 )
 
 var ErrUnauthorizedUpdate = fmt.Errorf("only the creator can update edits")
+var ErrUpdateClosedEdit = fmt.Errorf("only pending edits can be updated")
 var ErrClosedEdit = fmt.Errorf("votes can only be cast on pending edits")
 var ErrUnauthorizedBot = fmt.Errorf("you do not have permission to submit bot edits")
 var ErrUpdateLimit = fmt.Errorf("edit update limit reached")
 var ErrSceneDraftRequired = fmt.Errorf("scenes have to be submitted through drafts")
+var ErrPendingEdit = fmt.Errorf("cannot delete pending edit - only closed edits can be deleted")
+var ErrAmendPendingEdit = fmt.Errorf("cannot amend pending edit - only closed edits can be amended")
+var ErrNoChangesToAmend = fmt.Errorf("must specify at least one field or item to remove")
+var ErrAmendEmptyResult = fmt.Errorf("cannot remove all fields - edit must retain some content")
+var ErrHidePrimaryComment = fmt.Errorf("cannot hide the edit's primary comment")
 
 // Edit handles edit-related operations
 type Edit struct {
@@ -52,7 +60,19 @@ func (s *Edit) GetComments(ctx context.Context, editID uuid.UUID) ([]models.Edit
 	if err != nil {
 		return nil, err
 	}
-	return converter.EditCommentsToModels(comments), nil
+
+	result := converter.EditCommentsToModels(comments)
+
+	// Hidden comments are only visible to moderators and the comment's author
+	if err := auth.ValidateRole(ctx, models.RoleEnumModerate); err != nil {
+		currentUser := auth.GetCurrentUser(ctx)
+		result = slices.DeleteFunc(result, func(c models.EditComment) bool {
+			isOwner := currentUser != nil && c.UserID.Valid && c.UserID.UUID == currentUser.ID
+			return c.IsHidden && !isOwner
+		})
+	}
+
+	return result, nil
 }
 
 func (s *Edit) GetVotes(ctx context.Context, editID uuid.UUID) ([]models.EditVote, error) {
@@ -63,12 +83,380 @@ func (s *Edit) GetVotes(ctx context.Context, editID uuid.UUID) ([]models.EditVot
 	return converter.EditVotesToModels(votes), nil
 }
 
+// LoadVotesByEditIDs returns votes grouped in the same order as the supplied edit IDs.
+func (s *Edit) LoadVotesByEditIDs(ctx context.Context, ids []uuid.UUID) ([][]models.EditVote, []error) {
+	if len(ids) == 0 {
+		return make([][]models.EditVote, 0), nil
+	}
+
+	votes, err := s.queries.GetEditVotesByEditIDs(ctx, ids)
+	if err != nil {
+		return nil, errutil.DuplicateError(err, len(ids))
+	}
+
+	byEditID := make(map[uuid.UUID][]models.EditVote, len(ids))
+	for _, vote := range converter.EditVotesToModels(votes) {
+		byEditID[vote.EditID] = append(byEditID[vote.EditID], vote)
+	}
+
+	result := make([][]models.EditVote, len(ids))
+	for i, id := range ids {
+		result[i] = byEditID[id]
+	}
+
+	return result, nil
+}
+
 func (s *Edit) Delete(ctx context.Context, id uuid.UUID) (bool, error) {
 	err := s.queries.DeleteEdit(ctx, id)
 	if err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// DeleteWithAudit deletes a closed edit and creates an audit record
+func (s *Edit) DeleteWithAudit(ctx context.Context, input models.DeleteEditInput) error {
+	currentUser := auth.GetCurrentUser(ctx)
+	if currentUser == nil {
+		return fmt.Errorf("no authenticated user found")
+	}
+
+	return s.withTxn(func(tx *queries.Queries) error {
+		// Fetch the edit to verify it exists and is closed
+		dbEdit, err := tx.FindEdit(ctx, input.ID)
+		if err != nil {
+			return fmt.Errorf("failed to find edit: %w", err)
+		}
+
+		// Verify edit is closed
+		if dbEdit.ClosedAt == nil {
+			return ErrPendingEdit
+		}
+
+		// Only create audit log if retention is enabled (> 0 days)
+		retentionDays := config.GetModAuditRetentionDays()
+		if retentionDays > 0 {
+			auditData := struct {
+				queries.Edit
+				Data      json.RawMessage `json:"data"`
+				DeletedBy uuid.UUID       `json:"deleted_by"`
+				DeletedAt time.Time       `json:"deleted_at"`
+			}{
+				Edit:      dbEdit,
+				Data:      dbEdit.Data,
+				DeletedBy: currentUser.ID,
+				DeletedAt: time.Now(),
+			}
+
+			// Marshal audit data to JSON
+			auditDataJSON, err := json.Marshal(auditData)
+			if err != nil {
+				return fmt.Errorf("failed to marshal audit data: %w", err)
+			}
+
+			// Create mod_audit record
+			auditID, err := uuid.NewV7()
+			if err != nil {
+				return fmt.Errorf("failed to generate audit ID: %w", err)
+			}
+
+			_, err = tx.CreateModAudit(ctx, queries.CreateModAuditParams{
+				ID:         auditID,
+				Action:     queries.ModAuditActionEDITDELETE,
+				UserID:     uuid.NullUUID{UUID: currentUser.ID, Valid: true},
+				TargetID:   dbEdit.ID,
+				TargetType: "EDIT",
+				Data:       auditDataJSON,
+				Reason:     &input.Reason,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create audit record: %w", err)
+			}
+		}
+
+		if err := tx.DeleteNotificationsByEditComments(ctx, input.ID); err != nil {
+			return fmt.Errorf("failed to delete comment notifications for edit: %w", err)
+		}
+
+		if err := tx.DeleteNotificationsByTargetID(ctx, input.ID); err != nil {
+			return fmt.Errorf("failed to delete notifications for edit: %w", err)
+		}
+
+		// Delete the edit (cascades to comments and votes)
+		if err := tx.DeleteEdit(ctx, input.ID); err != nil {
+			return fmt.Errorf("failed to delete edit: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// AmendEdit amends a closed edit by removing specified fields/items from the edit data
+func (s *Edit) AmendEdit(ctx context.Context, input models.AmendEditInput) (*models.Edit, error) {
+	currentUser := auth.GetCurrentUser(ctx)
+	if currentUser == nil {
+		return nil, fmt.Errorf("no authenticated user found")
+	}
+
+	if len(input.RemoveFields) == 0 && len(input.RemoveAddedItems) == 0 && len(input.RemoveRemovedItems) == 0 {
+		return nil, ErrNoChangesToAmend
+	}
+
+	var updatedEdit *models.Edit
+	err := s.withTxn(func(tx *queries.Queries) error {
+		dbEdit, err := tx.FindEdit(ctx, input.ID)
+		if err != nil {
+			return fmt.Errorf("failed to find edit: %w", err)
+		}
+
+		if dbEdit.ClosedAt == nil {
+			return ErrAmendPendingEdit
+		}
+
+		var editData map[string]interface{}
+		if err := json.Unmarshal(dbEdit.Data, &editData); err != nil {
+			return fmt.Errorf("failed to parse edit data: %w", err)
+		}
+
+		newData, _ := editData["new_data"].(map[string]interface{})
+		oldData, _ := editData["old_data"].(map[string]interface{})
+		removedData := make(map[string]interface{})
+
+		// Remove scalar fields
+		for _, field := range input.RemoveFields {
+			if val, exists := newData[field]; exists {
+				removedData[field] = val
+				delete(newData, field)
+			}
+			delete(oldData, field)
+		}
+
+		// Remove array items
+		for _, removal := range input.RemoveAddedItems {
+			removeArrayItems(newData, "added_"+removal.Field, removal.Indices, removedData)
+		}
+		for _, removal := range input.RemoveRemovedItems {
+			removeArrayItems(newData, "removed_"+removal.Field, removal.Indices, removedData)
+		}
+
+		if len(newData) == 0 {
+			return ErrAmendEmptyResult
+		}
+
+		updatedData, err := json.Marshal(editData)
+		if err != nil {
+			return fmt.Errorf("failed to marshal updated edit data: %w", err)
+		}
+
+		if config.GetModAuditRetentionDays() > 0 {
+			if err := s.createAmendAudit(ctx, tx, dbEdit.ID, currentUser.ID, input.Reason, removedData); err != nil {
+				return err
+			}
+		}
+
+		dbEdit, err = tx.UpdateEditData(ctx, queries.UpdateEditDataParams{
+			ID:   input.ID,
+			Data: updatedData,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to update edit data: %w", err)
+		}
+
+		updatedEdit = converter.EditToModelPtr(dbEdit)
+		return nil
+	})
+
+	return updatedEdit, err
+}
+
+func (s *Edit) createAmendAudit(ctx context.Context, tx *queries.Queries, editID, userID uuid.UUID, reason string, removedData map[string]interface{}) error {
+	removedDataJSON, err := json.Marshal(removedData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal removed data: %w", err)
+	}
+
+	auditDataJSON, err := json.Marshal(models.EditAmendmentAuditData{
+		EditID:      editID,
+		AmendedBy:   userID,
+		AmendedAt:   time.Now(),
+		RemovedData: removedDataJSON,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal audit data: %w", err)
+	}
+
+	auditID, err := uuid.NewV7()
+	if err != nil {
+		return fmt.Errorf("failed to generate audit ID: %w", err)
+	}
+
+	_, err = tx.CreateModAudit(ctx, queries.CreateModAuditParams{
+		ID:         auditID,
+		Action:     queries.ModAuditActionEDITAMENDMENT,
+		UserID:     uuid.NullUUID{UUID: userID, Valid: true},
+		TargetID:   editID,
+		TargetType: "EDIT",
+		Data:       auditDataJSON,
+		Reason:     &reason,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audit record: %w", err)
+	}
+	return nil
+}
+
+// UpdateComment lets a moderator replace a comment's text, preserving the
+// original in the moderation audit log.
+func (s *Edit) UpdateComment(ctx context.Context, input models.UpdateEditCommentInput) (*models.EditComment, error) {
+	currentUser := auth.GetCurrentUser(ctx)
+	if currentUser == nil {
+		return nil, fmt.Errorf("no authenticated user found")
+	}
+
+	var updated *models.EditComment
+	err := s.withTxn(func(tx *queries.Queries) error {
+		comment, err := tx.FindEditComment(ctx, input.ID)
+		if err != nil {
+			return fmt.Errorf("failed to find comment: %w", err)
+		}
+
+		if config.GetModAuditRetentionDays() > 0 {
+			auditData, err := json.Marshal(models.EditCommentUpdateAuditData{
+				CommentID:    comment.ID,
+				EditID:       comment.EditID,
+				UpdatedBy:    currentUser.ID,
+				UpdatedAt:    time.Now(),
+				PreviousText: comment.Text,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to marshal audit data: %w", err)
+			}
+			if err := s.createCommentAudit(ctx, tx, queries.ModAuditActionEDITCOMMENTUPDATE, comment.ID, currentUser.ID, input.Reason, auditData); err != nil {
+				return err
+			}
+		}
+
+		dbComment, err := tx.UpdateEditCommentText(ctx, queries.UpdateEditCommentTextParams{
+			ID:   input.ID,
+			Text: input.Comment,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to update comment: %w", err)
+		}
+
+		updated = converter.EditCommentToModelPtr(dbComment)
+		return nil
+	})
+
+	return updated, err
+}
+
+// HideComment lets a moderator hide or unhide a comment from public view.
+func (s *Edit) HideComment(ctx context.Context, input models.HideEditCommentInput) (*models.EditComment, error) {
+	currentUser := auth.GetCurrentUser(ctx)
+	if currentUser == nil {
+		return nil, fmt.Errorf("no authenticated user found")
+	}
+
+	var updated *models.EditComment
+	err := s.withTxn(func(tx *queries.Queries) error {
+		comment, err := tx.FindEditComment(ctx, input.ID)
+		if err != nil {
+			return fmt.Errorf("failed to find comment: %w", err)
+		}
+
+		// The primary (submission) comment holds the edit's description and can't be hidden
+		primaryID, err := tx.GetPrimaryEditCommentID(ctx, comment.EditID)
+		if err != nil {
+			return fmt.Errorf("failed to find primary comment: %w", err)
+		}
+		if primaryID == comment.ID {
+			return ErrHidePrimaryComment
+		}
+
+		if config.GetModAuditRetentionDays() > 0 {
+			auditData, err := json.Marshal(models.EditCommentHideAuditData{
+				CommentID: comment.ID,
+				EditID:    comment.EditID,
+				ChangedBy: currentUser.ID,
+				ChangedAt: time.Now(),
+				Hidden:    input.Hidden,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to marshal audit data: %w", err)
+			}
+			if err := s.createCommentAudit(ctx, tx, queries.ModAuditActionEDITCOMMENTHIDE, comment.ID, currentUser.ID, input.Reason, auditData); err != nil {
+				return err
+			}
+		}
+
+		dbComment, err := tx.SetEditCommentHidden(ctx, queries.SetEditCommentHiddenParams{
+			ID:       input.ID,
+			IsHidden: input.Hidden,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to update comment: %w", err)
+		}
+
+		updated = converter.EditCommentToModelPtr(dbComment)
+		return nil
+	})
+
+	return updated, err
+}
+
+func (s *Edit) createCommentAudit(ctx context.Context, tx *queries.Queries, action queries.ModAuditAction, commentID, userID uuid.UUID, reason *string, auditData []byte) error {
+	auditID, err := uuid.NewV7()
+	if err != nil {
+		return fmt.Errorf("failed to generate audit ID: %w", err)
+	}
+
+	_, err = tx.CreateModAudit(ctx, queries.CreateModAuditParams{
+		ID:         auditID,
+		Action:     action,
+		UserID:     uuid.NullUUID{UUID: userID, Valid: true},
+		TargetID:   commentID,
+		TargetType: "EDIT_COMMENT",
+		Data:       auditData,
+		Reason:     reason,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audit record: %w", err)
+	}
+	return nil
+}
+
+func removeArrayItems(data map[string]interface{}, field string, indices []int, removed map[string]interface{}) {
+	arr, ok := data[field].([]interface{})
+	if !ok {
+		return
+	}
+
+	// Collect removed items
+	var removedItems []interface{}
+	for _, idx := range indices {
+		if idx >= 0 && idx < len(arr) {
+			removedItems = append(removedItems, arr[idx])
+		}
+	}
+	if len(removedItems) > 0 {
+		removed[field] = removedItems
+	}
+
+	// Sort descending and remove
+	slices.SortFunc(indices, func(a, b int) int { return b - a })
+	for _, idx := range indices {
+		if idx >= 0 && idx < len(arr) {
+			arr = slices.Delete(arr, idx, idx+1)
+		}
+	}
+
+	if len(arr) == 0 {
+		delete(data, field)
+	} else {
+		data[field] = arr
+	}
 }
 
 func (s *Edit) GetEditTarget(ctx context.Context, id uuid.UUID) (models.EditTarget, error) {
@@ -294,18 +682,30 @@ func (s *Edit) FindByTagID(ctx context.Context, tagID uuid.UUID) ([]models.Edit,
 	return modelEdits, nil
 }
 
-func (s *Edit) FindBySceneID(ctx context.Context, sceneID uuid.UUID) ([]models.Edit, error) {
-	edits, err := s.queries.GetEditsByScene(ctx, sceneID)
+// Dataloader for edits for multiple scenes
+func (s *Edit) LoadEditsBySceneIds(ctx context.Context, ids []uuid.UUID) ([][]models.Edit, []error) {
+	if len(ids) == 0 {
+		return make([][]models.Edit, 0), nil
+	}
+
+	rows, err := s.queries.GetEditsBySceneIds(ctx, ids)
 	if err != nil {
-		return nil, err
+		return nil, errutil.DuplicateError(err, len(ids))
 	}
 
-	var modelEdits []models.Edit
-	for _, edit := range edits {
-		modelEdits = append(modelEdits, converter.EditToModel(edit))
+	// Group results by scene ID. The query sorts globally, so each group stays
+	// in created_at DESC order.
+	m := make(map[uuid.UUID][]models.Edit)
+	for _, row := range rows {
+		m[row.SceneID] = append(m[row.SceneID], converter.EditToModel(row.Edit))
 	}
 
-	return modelEdits, nil
+	result := make([][]models.Edit, len(ids))
+	for i, id := range ids {
+		result[i] = m[id]
+	}
+
+	return result, nil
 }
 
 func (s *Edit) CreateSceneEdit(ctx context.Context, input models.SceneEditInput) (*models.Edit, error) {
@@ -319,7 +719,7 @@ func (s *Edit) CreateSceneEdit(ctx context.Context, input models.SceneEditInput)
 		return nil, err
 	}
 
-	newEdit := models.NewEdit(UUID, currentUser, models.TargetTypeEnumScene, input.Edit)
+	newEdit := models.NewEdit(UUID, currentUser.ID, models.TargetTypeEnumScene, input.Edit)
 
 	// For scene create, check if draft exist if draft is required
 	if config.GetRequireSceneDraft() && input.Edit.Operation == models.OperationEnumCreate {
@@ -355,7 +755,7 @@ func (s *Edit) CreateSceneEdit(ctx context.Context, input models.SceneEditInput)
 			}
 		}
 
-		return p.CreateComment(currentUser, input.Edit.Comment)
+		return p.CreateComment(currentUser.ID, input.Edit.Comment)
 	})
 
 	return newEdit, err
@@ -364,17 +764,18 @@ func (s *Edit) CreateSceneEdit(ctx context.Context, input models.SceneEditInput)
 func (s *Edit) UpdateSceneEdit(ctx context.Context, id uuid.UUID, input models.SceneEditInput) (*models.Edit, error) {
 	currentUser := auth.GetCurrentUser(ctx)
 
-	dbEdit, err := s.queries.FindEdit(ctx, id)
-	if err != nil {
-		return nil, err
-	}
+	var edit *models.Edit
+	err := s.withTxn(func(tx *queries.Queries) error {
+		dbEdit, err := tx.FindEdit(ctx, id)
+		if err != nil {
+			return err
+		}
 
-	edit := converter.EditToModelPtr(dbEdit)
-	if err = validateEditUpdate(*edit, currentUser); err != nil {
-		return nil, err
-	}
+		edit = converter.EditToModelPtr(dbEdit)
+		if err = validateEditUpdate(*edit, currentUser.ID); err != nil {
+			return err
+		}
 
-	err = s.withTxn(func(tx *queries.Queries) error {
 		p := Scene(ctx, tx, edit)
 		inputArgs := utils.Arguments(ctx).Field("input")
 		if err := p.Edit(input, inputArgs, true); err != nil {
@@ -386,7 +787,7 @@ func (s *Edit) UpdateSceneEdit(ctx context.Context, id uuid.UUID, input models.S
 			return err
 		}
 
-		return p.CreateComment(currentUser, input.Edit.Comment)
+		return p.CreateComment(currentUser.ID, input.Edit.Comment)
 	})
 
 	return edit, err
@@ -404,7 +805,7 @@ func (s *Edit) CreateStudioEdit(ctx context.Context, input models.StudioEditInpu
 		return nil, err
 	}
 
-	newEdit := models.NewEdit(UUID, currentUser, models.TargetTypeEnumStudio, input.Edit)
+	newEdit := models.NewEdit(UUID, currentUser.ID, models.TargetTypeEnumStudio, input.Edit)
 
 	err = s.withTxn(func(tx *queries.Queries) error {
 		p := Studio(ctx, tx, newEdit)
@@ -422,7 +823,7 @@ func (s *Edit) CreateStudioEdit(ctx context.Context, input models.StudioEditInpu
 			return err
 		}
 
-		return p.CreateComment(currentUser, input.Edit.Comment)
+		return p.CreateComment(currentUser.ID, input.Edit.Comment)
 	})
 
 	return newEdit, err
@@ -431,17 +832,18 @@ func (s *Edit) CreateStudioEdit(ctx context.Context, input models.StudioEditInpu
 func (s *Edit) UpdateStudioEdit(ctx context.Context, id uuid.UUID, input models.StudioEditInput) (*models.Edit, error) {
 	currentUser := auth.GetCurrentUser(ctx)
 
-	dbEdit, err := s.queries.FindEdit(ctx, id)
-	if err != nil {
-		return nil, err
-	}
+	var edit *models.Edit
+	err := s.withTxn(func(tx *queries.Queries) error {
+		dbEdit, err := tx.FindEdit(ctx, id)
+		if err != nil {
+			return err
+		}
 
-	edit := converter.EditToModelPtr(dbEdit)
-	if err = validateEditUpdate(*edit, currentUser); err != nil {
-		return nil, err
-	}
+		edit = converter.EditToModelPtr(dbEdit)
+		if err = validateEditUpdate(*edit, currentUser.ID); err != nil {
+			return err
+		}
 
-	err = s.withTxn(func(tx *queries.Queries) error {
 		p := Studio(ctx, tx, edit)
 		inputArgs := utils.Arguments(ctx).Field("input")
 		if err := p.Edit(input, inputArgs); err != nil {
@@ -453,7 +855,7 @@ func (s *Edit) UpdateStudioEdit(ctx context.Context, id uuid.UUID, input models.
 			return err
 		}
 
-		return p.CreateComment(currentUser, input.Edit.Comment)
+		return p.CreateComment(currentUser.ID, input.Edit.Comment)
 	})
 
 	return edit, err
@@ -477,7 +879,7 @@ func (s *Edit) CreateTagEdit(ctx context.Context, input models.TagEditInput) (*m
 		return nil, err
 	}
 
-	newEdit := models.NewEdit(UUID, currentUser, models.TargetTypeEnumTag, input.Edit)
+	newEdit := models.NewEdit(UUID, currentUser.ID, models.TargetTypeEnumTag, input.Edit)
 
 	err = s.withTxn(func(tx *queries.Queries) error {
 		p := Tag(ctx, tx, newEdit)
@@ -495,7 +897,7 @@ func (s *Edit) CreateTagEdit(ctx context.Context, input models.TagEditInput) (*m
 			return err
 		}
 
-		return p.CreateComment(currentUser, input.Edit.Comment)
+		return p.CreateComment(currentUser.ID, input.Edit.Comment)
 	})
 
 	return newEdit, err
@@ -504,17 +906,18 @@ func (s *Edit) CreateTagEdit(ctx context.Context, input models.TagEditInput) (*m
 func (s *Edit) UpdateTagEdit(ctx context.Context, id uuid.UUID, input models.TagEditInput) (*models.Edit, error) {
 	currentUser := auth.GetCurrentUser(ctx)
 
-	dbEdit, err := s.queries.FindEdit(ctx, id)
-	if err != nil {
-		return nil, err
-	}
+	var edit *models.Edit
+	err := s.withTxn(func(tx *queries.Queries) error {
+		dbEdit, err := tx.FindEdit(ctx, id)
+		if err != nil {
+			return err
+		}
 
-	edit := converter.EditToModelPtr(dbEdit)
-	if err = validateEditUpdate(*edit, currentUser); err != nil {
-		return nil, err
-	}
+		edit = converter.EditToModelPtr(dbEdit)
+		if err = validateEditUpdate(*edit, currentUser.ID); err != nil {
+			return err
+		}
 
-	err = s.withTxn(func(tx *queries.Queries) error {
 		p := Tag(ctx, tx, edit)
 		inputArgs := utils.Arguments(ctx).Field("input")
 		if err := p.Edit(input, inputArgs); err != nil {
@@ -526,7 +929,7 @@ func (s *Edit) UpdateTagEdit(ctx context.Context, id uuid.UUID, input models.Tag
 			return err
 		}
 
-		return p.CreateComment(currentUser, input.Edit.Comment)
+		return p.CreateComment(currentUser.ID, input.Edit.Comment)
 	})
 
 	return edit, err
@@ -544,7 +947,7 @@ func (s *Edit) CreatePerformerEdit(ctx context.Context, input models.PerformerEd
 		return nil, err
 	}
 
-	newEdit := models.NewEdit(UUID, currentUser, models.TargetTypeEnumPerformer, input.Edit)
+	newEdit := models.NewEdit(UUID, currentUser.ID, models.TargetTypeEnumPerformer, input.Edit)
 
 	err = s.withTxn(func(tx *queries.Queries) error {
 		p := Performer(ctx, tx, newEdit)
@@ -568,7 +971,7 @@ func (s *Edit) CreatePerformerEdit(ctx context.Context, input models.PerformerEd
 			}
 		}
 
-		return p.CreateComment(currentUser, input.Edit.Comment)
+		return p.CreateComment(currentUser.ID, input.Edit.Comment)
 	})
 
 	return newEdit, err
@@ -577,17 +980,18 @@ func (s *Edit) CreatePerformerEdit(ctx context.Context, input models.PerformerEd
 func (s *Edit) UpdatePerformerEdit(ctx context.Context, id uuid.UUID, input models.PerformerEditInput) (*models.Edit, error) {
 	currentUser := auth.GetCurrentUser(ctx)
 
-	dbEdit, err := s.queries.FindEdit(ctx, id)
-	if err != nil {
-		return nil, err
-	}
+	var edit *models.Edit
+	err := s.withTxn(func(tx *queries.Queries) error {
+		dbEdit, err := tx.FindEdit(ctx, id)
+		if err != nil {
+			return err
+		}
 
-	edit := converter.EditToModelPtr(dbEdit)
-	if err = validateEditUpdate(*edit, currentUser); err != nil {
-		return nil, err
-	}
+		edit = converter.EditToModelPtr(dbEdit)
+		if err = validateEditUpdate(*edit, currentUser.ID); err != nil {
+			return err
+		}
 
-	err = s.withTxn(func(tx *queries.Queries) error {
 		p := Performer(ctx, tx, edit)
 		inputArgs := utils.Arguments(ctx).Field("input")
 		if err := p.Edit(input, inputArgs, true); err != nil {
@@ -599,7 +1003,7 @@ func (s *Edit) UpdatePerformerEdit(ctx context.Context, id uuid.UUID, input mode
 			return err
 		}
 
-		return p.CreateComment(currentUser, input.Edit.Comment)
+		return p.CreateComment(currentUser.ID, input.Edit.Comment)
 	})
 
 	return edit, err
@@ -625,7 +1029,7 @@ func (s *Edit) CreateVote(ctx context.Context, input models.EditVoteInput) (*mod
 		}
 
 		if err := tx.CreateEditVote(ctx, queries.CreateEditVoteParams{
-			UserID: currentUser.ID,
+			UserID: uuid.NullUUID{UUID: currentUser.ID, Valid: true},
 			EditID: voteEdit.ID,
 			Vote:   input.Vote.String(),
 		}); err != nil {
@@ -644,7 +1048,7 @@ func (s *Edit) CreateVote(ctx context.Context, input models.EditVoteInput) (*mod
 		return nil, err
 	}
 
-	result, err := s.ResolveVotingThreshold(ctx, voteEdit)
+	result, err := s.resolveEditStatus(ctx, voteEdit)
 	// nolint: exhaustive
 	switch result {
 	case models.VoteStatusEnumAccepted:
@@ -673,7 +1077,11 @@ func (s *Edit) CreateComment(ctx context.Context, input models.EditCommentInput)
 	var comment *models.EditComment
 	err = s.withTxn(func(tx *queries.Queries) error {
 		currentUser := auth.GetCurrentUser(ctx)
-		params, err := converter.CreateEditCommentParams(edit.ID, currentUser.ID, input.Comment)
+		text, err := linkCommentEntities(ctx, tx, input.Comment)
+		if err != nil {
+			return err
+		}
+		params, err := converter.CreateEditCommentParams(edit.ID, currentUser.ID, text)
 		if err != nil {
 			return err
 		}
@@ -696,11 +1104,11 @@ func (s *Edit) Cancel(ctx context.Context, input models.CancelEditInput) (*model
 
 	if err = auth.ValidateOwner(ctx, e.UserID.UUID); err == nil {
 		return s.CloseEdit(ctx, input.ID, models.VoteStatusEnumCanceled)
-	} else if err = auth.ValidateAdmin(ctx); err == nil {
+	} else if err = auth.ValidateRole(ctx, models.RoleEnumModerate); err == nil {
 		currentUser := auth.GetCurrentUser(ctx)
 
 		if err := s.queries.CreateEditVote(ctx, queries.CreateEditVoteParams{
-			UserID: currentUser.ID,
+			UserID: uuid.NullUUID{UUID: currentUser.ID, Valid: true},
 			EditID: e.ID,
 			Vote:   models.VoteTypeEnumImmediateReject.String(),
 		}); err != nil {
@@ -713,7 +1121,7 @@ func (s *Edit) Cancel(ctx context.Context, input models.CancelEditInput) (*model
 	return nil, err
 }
 
-func (s *Edit) Apply(ctx context.Context, input models.ApplyEditInput) (*models.Edit, error) {
+func (s *Edit) Apply(ctx context.Context, input models.ApproveEditInput) (*models.Edit, error) {
 	edit, err := s.queries.FindEdit(ctx, input.ID)
 	if err != nil {
 		return nil, err
@@ -722,7 +1130,7 @@ func (s *Edit) Apply(ctx context.Context, input models.ApplyEditInput) (*models.
 	currentUser := auth.GetCurrentUser(ctx)
 
 	if err := s.queries.CreateEditVote(ctx, queries.CreateEditVoteParams{
-		UserID: currentUser.ID,
+		UserID: uuid.NullUUID{UUID: currentUser.ID, Valid: true},
 		EditID: edit.ID,
 		Vote:   models.VoteTypeEnumImmediateAccept.String(),
 	}); err != nil {
@@ -742,9 +1150,13 @@ func validateBotEdit(ctx context.Context, input *models.EditInput) error {
 	return nil
 }
 
-func validateEditUpdate(edit models.Edit, user *models.User) error {
-	if edit.UserID.UUID != user.ID {
+func validateEditUpdate(edit models.Edit, userID uuid.UUID) error {
+	if edit.UserID.UUID != userID {
 		return ErrUnauthorizedUpdate
+	}
+
+	if edit.ClosedAt != nil {
+		return ErrUpdateClosedEdit
 	}
 
 	if edit.UpdateCount >= config.GetEditUpdateLimit() {
@@ -877,41 +1289,115 @@ func (s *Edit) CloseEdit(ctx context.Context, editID uuid.UUID, status models.Vo
 	return updatedEdit, err
 }
 
-func (s *Edit) ResolveVotingThreshold(ctx context.Context, edit *models.Edit) (models.VoteStatusEnum, error) {
-	threshold := config.GetVoteApplicationThreshold()
-	if threshold == 0 {
-		return models.VoteStatusEnumPending, nil
-	}
+type editTally struct {
+	Accept            int
+	Reject            int
+	Destructive       bool
+	MinPeriodElapsed  bool
+	FullPeriodElapsed bool
+}
 
-	// For destructive edits we check if they've been open for a minimum period before applying
-	if edit.IsDestructive() {
-		if time.Since(edit.CreatedAt).Seconds() <= float64(config.GetMinDestructiveVotingPeriod()) {
-			return models.VoteStatusEnumPending, nil
+// Shared by vote casting and the cron sweep so the two can't disagree on what closes an edit.
+func decideEdit(tally editTally) models.VoteStatusEnum {
+	threshold := config.GetVoteApplicationThreshold()
+
+	// Destructive edits stay open for a minimum period however the votes fall.
+	if threshold > 0 && (tally.MinPeriodElapsed || !tally.Destructive) {
+		if tally.Accept >= threshold && tally.Reject == 0 {
+			return models.VoteStatusEnumAccepted
+		}
+		if tally.Reject >= threshold && tally.Accept == 0 {
+			return models.VoteStatusEnumRejected
 		}
 	}
 
-	votes, err := s.queries.GetEditVotes(ctx, edit.ID)
+	if tally.FullPeriodElapsed {
+		if tally.Accept-tally.Reject >= netVoteThreshold(tally.Destructive) {
+			return models.VoteStatusEnumAccepted
+		}
+		return models.VoteStatusEnumRejected
+	}
+
+	return models.VoteStatusEnumPending
+}
+
+// Require at least +1 votes to pass destructive edits
+func netVoteThreshold(destructive bool) int {
+	if destructive {
+		return 1
+	}
+	return 0
+}
+
+// Passing reports whether the edit closes as accepted on the votes cast so far.
+func (s *Edit) Passing(edit *models.Edit) bool {
+	return edit.VoteCount >= netVoteThreshold(edit.IsDestructive())
+}
+
+func (s *Edit) tallyVotes(ctx context.Context, editID uuid.UUID) (accept int, reject int, err error) {
+	votes, err := s.GetVotes(ctx, editID)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	accept, reject = countVotes(votes)
+	return accept, reject, nil
+}
+
+func countVotes(votes []models.EditVote) (accept int, reject int) {
+	for _, vote := range votes {
+		switch vote.Vote {
+		case models.VoteTypeEnumAccept.String():
+			accept++
+		case models.VoteTypeEnumReject.String():
+			reject++
+		}
+	}
+
+	return accept, reject
+}
+
+// An amended edit restarts its voting period.
+func editOpenedAt(edit *models.Edit) time.Time {
+	if edit.UpdatedAt != nil {
+		return *edit.UpdatedAt
+	}
+	return edit.CreatedAt
+}
+
+// ExpiryTime is when the edit closes if no further votes are cast.
+func (s *Edit) ExpiryTime(edit *models.Edit, votes []models.EditVote) *time.Time {
+	duration := config.GetVotingPeriod()
+
+	if edit.IsDestructive() {
+		accept, reject := countVotes(votes)
+
+		threshold := config.GetVoteApplicationThreshold()
+		unanimous := (accept >= threshold && reject == 0) || (reject >= threshold && accept == 0)
+		if threshold > 0 && unanimous {
+			duration = config.GetMinDestructiveVotingPeriod()
+		}
+	}
+
+	expiry := editOpenedAt(edit).Add(time.Second * time.Duration(duration))
+	return &expiry
+}
+
+func (s *Edit) resolveEditStatus(ctx context.Context, edit *models.Edit) (models.VoteStatusEnum, error) {
+	accept, reject, err := s.tallyVotes(ctx, edit.ID)
 	if err != nil {
 		return models.VoteStatusEnumPending, err
 	}
 
-	positive := 0
-	negative := 0
-	for _, vote := range votes {
-		if vote.Vote == models.VoteTypeEnumAccept.String() {
-			positive++
-		} else if vote.Vote == models.VoteTypeEnumReject.String() {
-			negative++
-		}
-	}
+	elapsed := time.Since(editOpenedAt(edit)).Seconds()
 
-	if positive >= threshold && negative == 0 {
-		return models.VoteStatusEnumAccepted, nil
-	} else if negative >= threshold && positive == 0 {
-		return models.VoteStatusEnumRejected, nil
-	}
-
-	return models.VoteStatusEnumPending, nil
+	return decideEdit(editTally{
+		Accept:            accept,
+		Reject:            reject,
+		Destructive:       edit.IsDestructive(),
+		MinPeriodElapsed:  elapsed > float64(config.GetMinDestructiveVotingPeriod()),
+		FullPeriodElapsed: elapsed > float64(config.GetVotingPeriod()),
+	}), nil
 }
 
 func (s *Edit) FindPendingPerformerCreation(ctx context.Context, input models.QueryExistingPerformerInput) ([]models.Edit, error) {
@@ -948,41 +1434,48 @@ func (s *Edit) FindPendingSceneCreation(ctx context.Context, input models.QueryE
 }
 
 func (s *Edit) CloseCompleted(ctx context.Context) ([]*models.Edit, error) {
-	edits, err := s.queries.FindCompletedEdits(ctx, queries.FindCompletedEditsParams{
+	rows, err := s.queries.FindCompletedEdits(ctx, queries.FindCompletedEditsParams{
 		VotingPeriod:        config.GetVotingPeriod(),
-		MinimumVotes:        config.GetVoteApplicationThreshold(),
 		MinimumVotingPeriod: config.GetMinDestructiveVotingPeriod(),
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	logger.Debugf("Closing %d completed edits", len(edits))
 	var closedEdits []*models.Edit
-	for _, edit := range edits {
-		e := converter.EditToModel(edit)
-		voteThreshold := 0
-		if e.IsDestructive() {
-			// Require at least +1 votes to pass destructive edits
-			voteThreshold = 1
-		}
+	var errs []error
+	for _, row := range rows {
+		e := converter.EditToModel(row.Edit)
 
 		var err error
 		var closedEdit *models.Edit
-		if e.VoteCount >= voteThreshold {
+		switch decideEdit(editTally{
+			Accept:            int(row.AcceptCount),
+			Reject:            int(row.RejectCount),
+			Destructive:       e.IsDestructive(),
+			MinPeriodElapsed:  row.MinPeriodElapsed,
+			FullPeriodElapsed: row.FullPeriodElapsed,
+		}) {
+		case models.VoteStatusEnumAccepted:
 			closedEdit, err = s.ApplyEdit(ctx, e.ID, false)
-		} else {
+		case models.VoteStatusEnumRejected:
 			closedEdit, err = s.CloseEdit(ctx, e.ID, models.VoteStatusEnumRejected)
+		default:
+			continue
 		}
 
+		// One failure must not block the rest of the queue on every subsequent run.
 		if err != nil {
-			return closedEdits, err
+			logger.Errorf("Failed to close edit %s: %v", e.ID, err)
+			errs = append(errs, err)
+			continue
 		}
 
 		closedEdits = append(closedEdits, closedEdit)
 	}
 
-	return closedEdits, nil
+	logger.Debugf("Closed %d of %d candidate edits", len(closedEdits), len(rows))
+	return closedEdits, errors.Join(errs...)
 }
 
 func (s *Edit) PromoteUserVoteRights(ctx context.Context, userID uuid.UUID, threshold int) error {

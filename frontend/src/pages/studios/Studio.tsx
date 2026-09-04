@@ -1,27 +1,31 @@
 import type { FC } from "react";
-import { Link, useLocation, useNavigate } from "react-router-dom";
 import { Button, Tab, Tabs } from "react-bootstrap";
-import { sortBy } from "lodash-es";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 
 import {
-  usePendingEditsCount,
-  TargetTypeEnum,
   CriterionModifier,
-  type StudioFragment as Studio,
+  type StudioQuery,
+  TargetTypeEnum,
+  usePendingEditsCount,
 } from "src/graphql";
-import { useCurrentUser } from "src/hooks";
-import { EditList, SceneList, URLList } from "src/components/list";
-import { StudioPerformers } from "./components";
 
+type Studio = NonNullable<StudioQuery["findStudio"]>;
+
+import { FavoriteStar, HighlightedLinks } from "src/components/fragments";
+import { EditList, SceneList, URLList } from "src/components/list";
+import { ROUTE_STUDIO_DELETE, ROUTE_STUDIO_EDIT } from "src/constants/route";
+import { useCurrentUser } from "src/hooks";
 import {
-  getImage,
   createHref,
-  studioHref,
   formatPendingEdits,
   getUrlBySite,
+  studioHref,
 } from "src/utils";
-import { ROUTE_STUDIO_EDIT, ROUTE_STUDIO_DELETE } from "src/constants/route";
-import { FavoriteStar } from "src/components/fragments";
+import {
+  StudioPerformers,
+  SubStudioList,
+  SubStudioPreview,
+} from "./components";
 
 const DEFAULT_TAB = "scenes";
 
@@ -41,15 +45,8 @@ const StudioComponent: FC<Props> = ({ studio }) => {
   });
   const pendingEditCount = editData?.queryEdits.count;
 
-  const studioImage = getImage(studio.images, "landscape");
-
-  const subStudios = sortBy(studio.child_studios, (s) =>
-    s.name.toLowerCase(),
-  ).map((s) => (
-    <li key={s.id}>
-      <Link to={studioHref(s)}>{s.name}</Link>
-    </li>
-  ));
+  const studioImage = studio.images[0]?.url;
+  const hasSubStudios = studio.sub_studios.count > 0;
 
   const setTab = (tab: string | null) =>
     navigate({ hash: tab === DEFAULT_TAB ? "" : `#${tab}` });
@@ -100,7 +97,7 @@ const StudioComponent: FC<Props> = ({ studio }) => {
         </div>
         {studioImage && (
           <div className="studio-photo">
-            <img src={getImage(studio.images, "landscape")} alt="Studio logo" />
+            <img src={studioImage} alt="Studio logo" />
           </div>
         )}
         <div>
@@ -119,30 +116,29 @@ const StudioComponent: FC<Props> = ({ studio }) => {
           )}
         </div>
       </div>
-      {subStudios.length > 0 && (
+      {hasSubStudios && (
         <>
           <h6>Sub Studios</h6>
-          <div className="sub-studio-list">
-            <ul>{subStudios}</ul>
-          </div>
+          <SubStudioPreview
+            id={studio.id}
+            onViewAll={() => setTab("sub-studios")}
+          />
         </>
       )}
+      <HighlightedLinks urls={studio.urls} />
       <Tabs
         activeKey={activeTab}
         id="studio-tabs"
         mountOnEnter
         onSelect={setTab}
       >
-        <Tab
-          eventKey="scenes"
-          title={subStudios.length > 0 ? "All Scenes" : "Scenes"}
-        >
+        <Tab eventKey="scenes" title={hasSubStudios ? "All Scenes" : "Scenes"}>
           <SceneList
             filter={{ parentStudio: studio.id }}
             favoriteFilter="performer"
           />
         </Tab>
-        {subStudios.length > 0 && (
+        {hasSubStudios && (
           <Tab eventKey="studio-scenes" title="Studio Scenes">
             <SceneList
               filter={{
@@ -152,6 +148,11 @@ const StudioComponent: FC<Props> = ({ studio }) => {
                 },
               }}
             />
+          </Tab>
+        )}
+        {hasSubStudios && (
+          <Tab eventKey="sub-studios" title="Sub Studios">
+            <SubStudioList id={studio.id} />
           </Tab>
         )}
         <Tab eventKey="performers" title="Performers">
